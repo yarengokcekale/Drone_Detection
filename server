@@ -1059,6 +1059,62 @@ def start_server():
                                 del active_users[username]
                                 print(f"Kullanıcı çıkış yaptı: {username}")
                         
+                        # Ateş geçmişi istegi
+                        elif message.get("type") == "get_fire_history":
+                            # Veritabanından ateş geçmişini al
+                            db_records = get_fire_history_from_db(limit=1000)
+                            fire_data = []
+                            
+                            for record in db_records:
+                                # Drone verilerini JSON'dan parse et
+                                drone_data = []
+                                if record[8]:  # drone_data sütunu
+                                    try:
+                                        drone_data = json.loads(record[8])
+                                    except:
+                                        drone_data = []
+                                
+                                # Her drone için ayrı bir kayıt oluştur
+                                if drone_data:
+                                    for drone in drone_data:
+                                        fire_record = {
+                                            "timestamp": record[1],  # timestamp
+                                            "client_id": record[2],  # client_id
+                                            "user": record[3],       # user
+                                            "drone_id": drone.get("id", "?"),
+                                            "drone_zone": drone.get("zone", "?"),
+                                            "drone_confidence": drone.get("confidence", 0),
+                                            "drone_x_coord": drone.get("x_coord", 0),
+                                            "drone_y_coord": drone.get("y_coord", 0),
+                                            "success": bool(record[4])  # success
+                                        }
+                                        fire_data.append(fire_record)
+                                else:
+                                    # Drone verisi yoksa boş bir kayıt oluştur
+                                    fire_record = {
+                                        "timestamp": record[1],
+                                        "client_id": record[2],
+                                        "user": record[3],
+                                        "drone_id": "?",
+                                        "drone_zone": "?",
+                                        "drone_confidence": 0,
+                                        "drone_x_coord": 0,
+                                        "drone_y_coord": 0,
+                                        "success": bool(record[4])
+                                    }
+                                    fire_data.append(fire_record)
+                            
+                            # Zaman damgasına göre sırala (en yeni önce)
+                            fire_data.sort(key=lambda x: x["timestamp"], reverse=True)
+                            
+                            response = {
+                                "type": "fire_history_data",
+                                "data": fire_data
+                            }
+                            
+                            client_socket.send((json.dumps(response) + "\n").encode('utf-8'))
+                            print(f"Ateş geçmişi gönderildi: {len(fire_data)} kayıt - Kullanıcı: {current_user['username'] if current_user else 'Unknown'}")
+                        
                         # Ateş emri kontrolü
                         elif message.get("command") == "FIRE":
                             username = message.get("user", "unknown")
