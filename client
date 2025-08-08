@@ -37,8 +37,6 @@ class DroneDetectionClient:
         
         # Geçmiş tespitler için deque
         self.detection_history = collections.deque(maxlen=1000)
-        # Ateş geçmişi için deque
-        self.fire_history = collections.deque(maxlen=1000)
         
         self.setup_login_ui()
         
@@ -466,49 +464,81 @@ class DroneDetectionClient:
                                  font=("Arial", 18, "bold"),
                                  bg="#1a1a1a", fg="#00ff00")
         reports_title.pack(pady=20)
-        
-        # Rapor türü seçimi
-        report_type_frame = tk.Frame(self.reports_frame, bg="#1a1a1a")
-        report_type_frame.pack(fill=tk.X, padx=20, pady=10)
-        
-        tk.Label(report_type_frame, text="Rapor Türü:", bg="#1a1a1a", fg="#ffffff", font=("Arial", 10)).pack(side=tk.LEFT, padx=(0, 10))
-        
-        self.report_type_var = tk.StringVar(value="detection")
-        tk.Radiobutton(report_type_frame, text="Tespit Geçmişi", variable=self.report_type_var, value="detection", 
-                       bg="#1a1a1a", fg="#ffffff", selectcolor="#1a1a1a", command=self.update_reports_table).pack(side=tk.LEFT, padx=(0, 10))
-        tk.Radiobutton(report_type_frame, text="Ateş Geçmişi", variable=self.report_type_var, value="fire", 
-                       bg="#1a1a1a", fg="#ffffff", selectcolor="#1a1a1a", command=self.update_reports_table).pack(side=tk.LEFT)
-        
-        reports_table_frame = tk.LabelFrame(self.reports_frame,
-                                            text="📋 Rapor Tablosu",
+
+        # Raporlar için notebook (tab) oluştur
+        self.reports_notebook = ttk.Notebook(self.reports_frame)
+        self.reports_notebook.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+
+        # Tespit Geçmişi Tabı
+        self.detection_tab = tk.Frame(self.reports_notebook, bg="#1a1a1a")
+        self.reports_notebook.add(self.detection_tab, text="📋 Tespit Geçmişi")
+
+        # Atış Geçmişi Tabı
+        self.fire_history_tab = tk.Frame(self.reports_notebook, bg="#1a1a1a")
+        self.reports_notebook.add(self.fire_history_tab, text="🎯 Atış Geçmişi")
+
+        # Tespit Geçmişi Tablosu
+        detection_table_frame = tk.LabelFrame(self.detection_tab,
+                                            text="📋 Tespit Geçmişi Tablosu",
                                             font=("Arial", 12, "bold"),
                                             bg="#2c2c2c", fg="#ffffff")
-        reports_table_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        detection_table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         # Raporlar tablosu sütunları
-        self.report_columns = {
-            "detection": ("Tespit Saati", "ID", "Güven", "Bölge", "Tehlike Seviyesi", "X Ekseni", "Y Ekseni"),
-            "fire": ("Tarih", "İstemci", "Kullanıcı", "Drone ID", "Bölge", "Güven", "X Ekseni", "Y Ekseni", "Sonuç")
-        }
-        
-        self.reports_tree = ttk.Treeview(reports_table_frame,
-                                         columns=self.report_columns["detection"],
+        report_columns = ("Tespit Saati", "ID", "Güven", "Bölge", "Tehlike Seviyesi", "X Ekseni", "Y Ekseni")
+        self.reports_tree = ttk.Treeview(detection_table_frame,
+                                         columns=report_columns,
                                          show="headings",
                                          style="GPS.Treeview")
 
         report_widths = [180, 60, 80, 120, 120, 70, 70]
-        for i, col in enumerate(self.report_columns["detection"]):
+        for i, col in enumerate(report_columns):
             self.reports_tree.heading(col, text=col)
             self.reports_tree.column(col, width=report_widths[i], anchor=tk.CENTER)
 
-        report_tree_scroll_y = ttk.Scrollbar(reports_table_frame, orient=tk.VERTICAL, command=self.reports_tree.yview)
-        report_tree_scroll_x = ttk.Scrollbar(reports_table_frame, orient=tk.HORIZONTAL, command=self.reports_tree.xview)
+        report_tree_scroll_y = ttk.Scrollbar(detection_table_frame, orient=tk.VERTICAL, command=self.reports_tree.yview)
+        report_tree_scroll_x = ttk.Scrollbar(detection_table_frame, orient=tk.HORIZONTAL, command=self.reports_tree.xview)
         self.reports_tree.configure(yscrollcommand=report_tree_scroll_y.set, xscrollcommand=report_tree_scroll_x.set)
 
         self.reports_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         report_tree_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
         report_tree_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
-    
+
+        # Atış Geçmişi Tablosu
+        fire_history_table_frame = tk.LabelFrame(self.fire_history_tab,
+                                               text="🎯 Atış Geçmişi Tablosu",
+                                               font=("Arial", 12, "bold"),
+                                               bg="#2c2c2c", fg="#ffffff")
+        fire_history_table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Atış geçmişi sütunları
+        fire_history_columns = ("Atış Saati", "Kullanıcı", "Drone ID", "Drone Konumu", "X Koordinat", "Y Koordinat", "Başarı")
+        self.fire_history_tree = ttk.Treeview(fire_history_table_frame,
+                                             columns=fire_history_columns,
+                                             show="headings",
+                                             style="GPS.Treeview")
+
+        fire_history_widths = [180, 120, 80, 120, 100, 100, 80]
+        for i, col in enumerate(fire_history_columns):
+            self.fire_history_tree.heading(col, text=col)
+            self.fire_history_tree.column(col, width=fire_history_widths[i], anchor=tk.CENTER)
+
+        fire_history_scroll_y = ttk.Scrollbar(fire_history_table_frame, orient=tk.VERTICAL, command=self.fire_history_tree.yview)
+        fire_history_scroll_x = ttk.Scrollbar(fire_history_table_frame, orient=tk.HORIZONTAL, command=self.fire_history_tree.xview)
+        self.fire_history_tree.configure(yscrollcommand=fire_history_scroll_y.set, xscrollcommand=fire_history_scroll_x.set)
+
+        self.fire_history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        fire_history_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        fire_history_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Atış geçmişi için yenile butonu
+        refresh_fire_history_button = tk.Button(self.fire_history_tab,
+                                               text="🔄 Atış Geçmişini Yenile",
+                                               font=("Arial", 10, "bold"),
+                                               bg="#0066cc", fg="#ffffff",
+                                               command=self.refresh_fire_history)
+        refresh_fire_history_button.pack(pady=10)
+
     def show_frame(self, frame):
         """Belirtilen frame'i gösterir ve diğerlerini gizler"""
         self.main_detection_frame.pack_forget()
@@ -516,10 +546,11 @@ class DroneDetectionClient:
         
         frame.pack(fill=tk.BOTH, expand=True)
         
-        # Raporlar ekranına geçiş yaparken tabloyu güncelle
+        # Raporlar ekranına geçiş yaparken tabloları güncelle
         if frame == self.reports_frame:
             self.update_reports_table()
-    
+            self.update_fire_history_table()
+
     def draw_map_base(self):
         """Harita canvas'ının taban ızgarasını ve yön göstergelerini çizer"""
         self.map_canvas.delete("all")
@@ -714,10 +745,6 @@ class DroneDetectionClient:
                             # Ateş komutu yanıtı
                             elif response.get("type") == "fire_response":
                                 self.window.after(0, lambda r=response: self.handle_fire_response(r))
-                            # Ateş geçmişi yanıtı
-                            elif response.get("type") == "fire_history_data":
-                                fire_data = response.get("data", [])
-                                self.window.after(0, lambda: self.update_fire_history_table(fire_data))
                             else:
                                 # Normal drone verisi
                                 self.current_data = response
@@ -869,76 +896,175 @@ class DroneDetectionClient:
         for item in self.reports_tree.get_children():
             self.reports_tree.delete(item)
         
-        report_type = self.report_type_var.get()
-        
-        # Rapor türüne göre sütunları güncelle
-        self.reports_tree["columns"] = self.report_columns[report_type]
-        
-        # Mevcut sütunları temizle
-        for col in self.reports_tree["columns"]:
-            self.reports_tree.heading(col, text="")
-            self.reports_tree.column(col, width=0)
-        
-        # Yeni sütunları ayarla
-        if report_type == "detection":
-            report_widths = [180, 60, 80, 120, 120, 70, 70]
-        else:  # fire
-            report_widths = [180, 100, 100, 80, 120, 80, 70, 70, 100]
-        
-        for i, col in enumerate(self.report_columns[report_type]):
-            self.reports_tree.heading(col, text=col)
-            self.reports_tree.column(col, width=report_widths[i], anchor=tk.CENTER)
-        
-        # Rapor türüne göre verileri göster
-        if report_type == "detection":
-            # Tespit geçmişini göster
-            sorted_history = sorted(self.detection_history, key=lambda x: x['timestamp'], reverse=True)
-            
-            for entry in sorted_history:
-                display_x = entry.get("display_x", 0.0)
-                display_y = entry.get("display_y", 0.0)
+        # Geçmiş kayıtları yeniden eskiden yeniye doğru sırala
+        sorted_history = sorted(self.detection_history, key=lambda x: x['timestamp'], reverse=True)
 
-                values = (
-                    entry.get("timestamp", "--"),
-                    f"D{entry.get('id', '-')}",
-                    f"{entry.get('confidence', 0):.1f}%",
-                    entry.get("zone", self.get_direction_from_coordinates(display_x, display_y)),
-                    entry.get("threat_level", "YOK"),
-                    f"{display_x:.2f}",
-                    f"{display_y:.2f}"
-                )
-                self.reports_tree.insert("", tk.END, values=values)
-        
-        elif report_type == "fire":
-            # Ateş geçmişi için sunucudan veri iste
-            if self.connected and self.socket:
-                try:
-                    request = {
-                        "type": "get_fire_history"
-                    }
-                    self.socket.send((json.dumps(request) + "\n").encode('utf-8'))
-                except Exception as e:
-                    print(f"Ateş geçmişi isteği gönderilemedi: {e}")
-    
-    def update_fire_history_table(self, fire_data):
-        """Ateş geçmişi tablosunu günceller"""
-        for item in self.reports_tree.get_children():
-            self.reports_tree.delete(item)
-        
-        for record in fire_data:
-            result_text = "Başarılı" if record.get("success", False) else "Başarısız"
+        for entry in sorted_history:
+            display_x = entry.get("display_x", 0.0)
+            display_y = entry.get("display_y", 0.0)
+
             values = (
-                record.get("timestamp", "--"),
-                record.get("client_id", "--"),
-                record.get("user", "--"),
-                record.get("drone_id", "--"),
-                record.get("drone_zone", "--"),
-                f"{record.get('drone_confidence', 0):.1f}%",
-                f"{record.get('drone_x_coord', 0):.2f}",
-                f"{record.get('drone_y_coord', 0):.2f}",
-                result_text
+                entry.get("timestamp", "--"),
+                f"D{entry.get('id', '-')}",
+                f"{entry.get('confidence', 0):.1f}%",
+                entry.get("zone", self.get_direction_from_coordinates(display_x, display_y)),
+                entry.get("threat_level", "YOK"),
+                f"{display_x:.2f}",
+                f"{display_y:.2f}"
             )
             self.reports_tree.insert("", tk.END, values=values)
+
+    def refresh_fire_history(self):
+        """Atış geçmişini veritabanından yeniler"""
+        try:
+            self.update_fire_history_table()
+            print("Atış geçmişi başarıyla güncellendi")
+        except Exception as e:
+            print(f"Atış geçmişi güncelleme hatası: {e}")
+            self.show_message_box("Hata", f"Atış geçmişi güncellenirken hata oluştu: {str(e)}", "error")
+
+    def update_fire_history_table(self):
+        """Atış geçmişi tablosunu günceller"""
+        for item in self.fire_history_tree.get_children():
+            self.fire_history_tree.delete(item)
+        
+        try:
+            # Veritabanından atış geçmişini al
+            fire_history_data = self.get_fire_history_from_db()
+            
+            for fire_event in fire_history_data:
+                timestamp = fire_event.get("timestamp", "--")
+                user = fire_event.get("user", "Bilinmiyor")
+                drone_id = fire_event.get("drone_id", "?")
+                zone = fire_event.get("zone", "Bilinmiyor")
+                x_coord = fire_event.get("x_coord", 0.0)
+                y_coord = fire_event.get("y_coord", 0.0)
+                success = fire_event.get("success", False)
+                
+                # Başarı durumunu metin olarak göster
+                success_text = "✅ Başarılı" if success else "❌ Başarısız"
+                success_color = "green" if success else "red"
+                
+                values = (
+                    timestamp,
+                    user,
+                    f"D{drone_id:03d}" if isinstance(drone_id, int) else str(drone_id),
+                    zone,
+                    f"{x_coord:.2f}",
+                    f"{y_coord:.2f}",
+                    success_text
+                )
+                
+                item = self.fire_history_tree.insert("", tk.END, values=values)
+                self.fire_history_tree.item(item, tags=(success_color,))
+            
+            # Renk etiketlerini yapılandır
+            self.fire_history_tree.tag_configure("green", foreground="green")
+            self.fire_history_tree.tag_configure("red", foreground="red")
+            
+        except Exception as e:
+            print(f"Atış geçmişi tablosu güncelleme hatası: {e}")
+            # Hata durumunda boş tablo göster
+            pass
+
+    def get_fire_history_from_db(self):
+        """Veritabanından atış geçmişini alır"""
+        try:
+            import sqlite3
+            
+            # Veritabanı dosya yolu (server ile aynı)
+            db_path = "tespit_gecmisi.db"
+            
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            # Atış geçmişini al (en son 1000 kayıt)
+            cursor.execute('''
+            SELECT timestamp, client_id, drone_id, zone, confidence, x_coord, y_coord, success
+            FROM fire_history
+            ORDER BY timestamp DESC
+            LIMIT 1000
+            ''')
+            
+            fire_events = []
+            for row in cursor.fetchall():
+                fire_event = {
+                    "timestamp": row[0],
+                    "client_id": row[1],
+                    "drone_id": row[2],
+                    "zone": row[3],
+                    "confidence": row[4],
+                    "x_coord": row[5],
+                    "y_coord": row[6],
+                    "success": bool(row[7])
+                }
+                
+                # Kullanıcı bilgisini user_activities tablosundan al
+                user = self.get_user_from_activities(fire_event["timestamp"], conn)
+                fire_event["user"] = user
+                
+                fire_events.append(fire_event)
+            
+            conn.close()
+            return fire_events
+            
+        except Exception as e:
+            print(f"Veritabanından atış geçmişi alınırken hata: {e}")
+            return []
+
+    def get_user_from_activities(self, timestamp, conn):
+        """User_activities tablosundan belirli bir timestamp için kullanıcı bilgisini alır"""
+        try:
+            cursor = conn.cursor()
+            
+            # Timestamp'e yakın olan fire aktivitesini bul (10 saniye tolerans)
+            # Timestamp formatını parse et
+            try:
+                # Timestamp'i datetime objesine çevir
+                if '.' in timestamp:
+                    dt = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S.%f')
+                else:
+                    dt = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
+                
+                # 10 saniye öncesi ve sonrası
+                start_time = (dt - timedelta(seconds=10)).strftime('%Y-%m-%d %H:%M:%S')
+                end_time = (dt + timedelta(seconds=10)).strftime('%Y-%m-%d %H:%M:%S')
+                
+                cursor.execute('''
+                SELECT username
+                FROM user_activities
+                WHERE activity_type = 'fire' 
+                AND timestamp BETWEEN ? AND ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+                ''', (start_time, end_time))
+                
+                result = cursor.fetchone()
+                if result:
+                    return result[0]
+                    
+            except Exception as e:
+                print(f"Timestamp parse hatası: {e}")
+            
+            # Eğer user_activities'de bulunamazsa, client_id'den çıkar
+            return "Bilinmiyor"
+            
+        except Exception as e:
+            print(f"Kullanıcı bilgisi alınırken hata: {e}")
+            return "Bilinmiyor"
+    
+    def extract_user_from_client_id(self, client_id):
+        """Client ID'den kullanıcı bilgisini çıkarır"""
+        try:
+            # Client ID formatı: "gps_client_1" veya benzeri
+            # Eğer client_id'de kullanıcı bilgisi varsa çıkar
+            if "_" in client_id:
+                parts = client_id.split("_")
+                if len(parts) >= 2:
+                    return parts[-1]  # Son kısmı kullanıcı olarak al
+            return client_id
+        except:
+            return "Bilinmiyor"
     
     def fire_command(self):
         """'FIRE' komutunu sunucuya gönderir ve yanıtı işler"""
