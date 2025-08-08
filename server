@@ -14,13 +14,13 @@ import pandas as pd
 from tkinter import filedialog, messagebox
 import random
 import os
-import sqlite3  # SQLite modülünü ekledik
+import sqlite3
 
 # Model ve ses dosyası yolları
 model_path = r"C:\Users\yaren\OneDrive\Masaüstü\drone_dataset\runs\detect\train\weights\best.pt"
 sound_path = r"C:\Users\yaren\OneDrive\Masaüstü\drone_dataset\alert.wav"
 json_path = r"C:\Users\yaren\OneDrive\Masaüstü\drone_dataset\kullanici_bilgileri.json"
-db_path = "tespit_gecmisi.db"  # Veritabanı dosya yolu
+db_path = "tespit_gecmisi.db"
 
 # Modeli yükle
 try:
@@ -40,11 +40,11 @@ except Exception as e:
     print(f"Ses dosyası yükleme hatası: {e}")
 
 # TCP Server ayarları
-SERVER_HOST = '127.0.0.1'  # localhost
+SERVER_HOST = '127.0.0.1'
 SERVER_PORT = 8888
 connected_clients = []
 
-# Global değişkenler - Client ile uyumlu format
+# Global değişkenler
 current_drone_data = {
     "drone_count": 0,
     "threat_level": "YOK",
@@ -53,25 +53,18 @@ current_drone_data = {
     "fire_authorized": False
 }
 
-# Raporlar için geçmiş veriler
 detection_history = []
 max_history = 1000
-
-# Ateş geçmişi
 fire_history = []
 max_fire_history = 1000
-
-# Kullanıcı aktiviteleri
 user_activities = {}
 active_users = {}
 
 # ===== VERİTABANI FONKSİYONLARI =====
 def init_db():
-    """Veritabanını ve tabloyu oluştur"""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
-    # Tespit geçmişi tablosu
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS detection_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,7 +78,6 @@ def init_db():
     )
     ''')
     
-    # Ateş geçmişi tablosu
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS fire_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,7 +92,6 @@ def init_db():
     )
     ''')
     
-    # Kullanıcı aktiviteleri tablosu
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS user_activities (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,7 +107,6 @@ def init_db():
     print("Veritabanı başarıyla oluşturuldu")
 
 def save_detection_to_db(detection):
-    """Tek bir tespit kaydını veritabanına kaydet"""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
@@ -138,7 +128,6 @@ def save_detection_to_db(detection):
     conn.close()
 
 def save_fire_to_db(fire_event):
-    """Ateş olayını veritabanına kaydet"""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
@@ -162,7 +151,6 @@ def save_fire_to_db(fire_event):
     conn.close()
 
 def save_user_activity_to_db(username, activity_type, timestamp, details=None):
-    """Kullanıcı aktivitesini veritabanına kaydet"""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
@@ -176,7 +164,6 @@ def save_user_activity_to_db(username, activity_type, timestamp, details=None):
     conn.close()
 
 def get_all_detections_from_db():
-    """Veritabanından tüm tespitleri getir"""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
@@ -202,7 +189,6 @@ def get_all_detections_from_db():
     return detections
 
 def get_all_fire_history_from_db():
-    """Veritabanından tüm ateş geçmişini getir"""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
@@ -239,7 +225,6 @@ init_db()
 
 # ===== KULLANICI YÖNETİMİ FONKSİYONLARI =====
 def load_users_from_json():
-    """JSON dosyasından kullanıcı bilgilerini yükler"""
     users_db = {}
     
     try:
@@ -271,38 +256,10 @@ def load_users_from_json():
         print(f"Sunucu Beklenmeyen Hata: {str(e)}")
         return {}
 
-# Kullanıcı veritabanını yükle
 users_db = load_users_from_json()
-
-# ===== YARDIMCI FONKSİYONLAR =====
-def parse_timestamp(timestamp_str):
-    """Timestamp string'ini datetime objesine çevir"""
-    if not timestamp_str:
-        return None
-    
-    try:
-        # Mikrosaniye formatını kontrol et (örn: 2024-01-01 12:00:00.123456)
-        if '.' in timestamp_str and len(timestamp_str.split('.')[-1]) >= 3:
-            return datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S.%f')
-        else:
-            # Saniye formatını kontrol et (örn: 2024-01-01 12:00:00)
-            return datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
-    except Exception as e:
-        print(f"Timestamp parse hatası: {timestamp_str} - {e}")
-        return None
-
-def format_duration(duration_seconds):
-    """Saniye cinsinden süreyi okunabilir formata çevir"""
-    if duration_seconds < 0:
-        return "Hesaplanamadı"
-    
-    hours, remainder = divmod(duration_seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    return f"{int(hours)}s {int(minutes)}d {int(seconds)}s"
 
 # ===== YÖN FONKSİYONLARI =====
 def get_direction_from_coordinates(x, y):
-    """Client ile aynı yön hesaplama algoritması"""
     tolerance = 0.1
     
     if abs(x) <= tolerance and abs(y) <= tolerance:
@@ -322,9 +279,52 @@ def get_direction_from_coordinates(x, y):
         else:
             return "GÜNEYDOĞU"
 
+# ===== OTURUM SÜRESİ HESAPLAMA =====
+def calculate_session_duration(activities, username, is_active):
+    user_activities = [act for act in activities if act[0] == username]
+    
+    if not user_activities:
+        return "N/A"
+    
+    user_activities.sort(key=lambda x: x[2])
+    
+    sessions = []
+    current_login = None
+    
+    for activity in user_activities:
+        activity_type = activity[1]
+        timestamp = activity[2]
+        
+        if activity_type == "login":
+            if current_login is not None:
+                sessions.append((current_login, timestamp))
+            current_login = timestamp
+        elif activity_type == "logout":
+            if current_login is not None:
+                sessions.append((current_login, timestamp))
+                current_login = None
+    
+    if current_login is not None and is_active:
+        login_time = datetime.strptime(current_login, '%Y-%m-%d %H:%M:%S.%f')
+        now = datetime.now()
+        duration = now - login_time
+        hours, remainder = divmod(duration.total_seconds(), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{int(hours)}s {int(minutes)}d {int(seconds)}s"
+    
+    if sessions:
+        last_session = sessions[-1]
+        login_time = datetime.strptime(last_session[0], '%Y-%m-%d %H:%M:%S.%f')
+        logout_time = datetime.strptime(last_session[1], '%Y-%m-%d %H:%M:%S.%f')
+        duration = logout_time - login_time
+        hours, remainder = divmod(duration.total_seconds(), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{int(hours)}s {int(minutes)}d {int(seconds)}s"
+    
+    return "N/A"
+
 # ===== ARAYÜZ GÜNCELLEME FONKSİYONLARI =====
 def update_current_tree():
-    """Anlık tespitler tablosunu güncelle"""
     for item in current_tree.get_children():
         current_tree.delete(item)
     
@@ -346,14 +346,11 @@ def update_current_tree():
         ))
 
 def update_history_tree():
-    """Geçmiş tespitler tablosunu güncelle"""
     for item in history_tree.get_children():
         history_tree.delete(item)
     
-    # Hem geçici hafızadaki hem de veritabanındaki verileri göster
     all_detections = detection_history + get_all_detections_from_db()
     
-    # En son 100 kaydı göster
     for detection in all_detections[-100:]:
         history_tree.insert("", "end", values=(
             detection["timestamp"],
@@ -366,8 +363,6 @@ def update_history_tree():
         ))
 
 def update_statistics():
-    """İstatistikleri güncelle"""
-    # Veritabanından tüm tespitleri al
     all_detections = get_all_detections_from_db()
     total_detections = len(all_detections)
     
@@ -399,11 +394,9 @@ def update_statistics():
         stat_cards[i].config(text=value)
 
 def update_fire_history_tree():
-    """Ateş geçmişi tablosunu güncelle"""
     for item in fire_history_tree.get_children():
         fire_history_tree.delete(item)
     
-    # Hem geçici hafızadaki hem de veritabanındaki verileri göster
     all_fire_events = fire_history + get_all_fire_history_from_db()
     
     for fire_event in all_fire_events[-100:]:
@@ -428,130 +421,80 @@ def update_fire_history_tree():
     fire_history_tree.tag_configure("red", foreground="red")
 
 def update_user_activity_tree():
-    """Kullanıcı aktiviteleri tablosunu güncelle"""
-    try:
-        for item in user_activity_tree.get_children():
-            user_activity_tree.delete(item)
+    for item in user_activity_tree.get_children():
+        user_activity_tree.delete(item)
+    
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    SELECT username, activity_type, timestamp, details
+    FROM user_activities
+    ORDER BY timestamp DESC
+    ''')
+    activities = cursor.fetchall()
+    
+    user_data = {}
+    for username, user_info in users_db.items():
+        user_data[username] = {
+            "name": user_info["name"],
+            "role": user_info["role"],
+            "status": "Çevrimdışı",
+            "session_duration": "N/A",
+            "last_activity": "N/A",
+            "fire_count": 0
+        }
+    
+    for activity in activities:
+        username = activity[0]
+        activity_type = activity[1]
+        timestamp = activity[2]
+        details = activity[3]
         
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        # Kullanıcı aktivitelerini veritabanından çek
-        cursor.execute('''
-        SELECT username, activity_type, timestamp, details
-        FROM user_activities
-        ORDER BY timestamp DESC
-        ''')
-        
-        activities = cursor.fetchall()
-        
-        # Kullanıcı bilgilerini hazırla
-        user_data = {}
-        for username, user_info in users_db.items():
-            user_data[username] = {
-                "name": user_info["name"],
-                "role": user_info["role"],
-                "status": "Çevrimdışı",
-                "session_duration": "N/A",
-                "last_activity": "N/A",
-                "fire_count": 0,
-                "login_time": None,
-                "logout_time": None
-            }
-        
-        # Aktiviteleri işle
-        for activity in activities:
-            username = activity[0]
-            activity_type = activity[1]
-            timestamp = activity[2]
-            details = activity[3]
+        if username not in user_data:
+            continue
             
-            if username not in user_data:
-                continue
-                
-            if activity_type == "login":
-                user_data[username]["status"] = "Aktif"
-                user_data[username]["last_activity"] = timestamp
-                user_data[username]["login_time"] = parse_timestamp(timestamp)
-            elif activity_type == "logout":
-                user_data[username]["status"] = "Çevrimdışı"
-                user_data[username]["logout_time"] = parse_timestamp(timestamp)
-                
-                # Oturum süresini hesapla
-                if user_data[username]["login_time"] and user_data[username]["logout_time"]:
-                    duration = user_data[username]["logout_time"] - user_data[username]["login_time"]
-                    user_data[username]["session_duration"] = format_duration(duration.total_seconds())
-            elif activity_type == "fire":
-                user_data[username]["fire_count"] += 1
-                user_data[username]["last_activity"] = timestamp
+        if user_data[username]["last_activity"] == "N/A" or timestamp > user_data[username]["last_activity"]:
+            user_data[username]["last_activity"] = timestamp
         
-        # Aktif kullanıcıları güncelle
-        for username in active_users:
-            if username in user_data:
-                user_data[username]["status"] = "Aktif"
-                if user_data[username]["login_time"]:
-                    now = datetime.now()
-                    duration = now - user_data[username]["login_time"]
-                    user_data[username]["session_duration"] = format_duration(duration.total_seconds())
+        if activity_type == "fire":
+            user_data[username]["fire_count"] += 1
+    
+    for username in active_users:
+        if username in user_data:
+            user_data[username]["status"] = "Aktif"
+    
+    for username, data in user_data.items():
+        data["session_duration"] = calculate_session_duration(
+            activities, username, data["status"] == "Aktif"
+        )
+    
+    for username, data in user_data.items():
+        status_color = "green" if data["status"] == "Aktif" else "red"
         
-        # Tabloyu doldur
-        for username, data in user_data.items():
-            status_color = "green" if data["status"] == "Aktif" else "red"
-            
-            item = user_activity_tree.insert("", "end", values=(
-                username,
-                data["name"],
-                data["role"],
-                data["status"],
-                data["session_duration"],
-                data["last_activity"],
-                data["fire_count"]
-            ))
-            
-            user_activity_tree.item(item, tags=(status_color,))
+        item = user_activity_tree.insert("", "end", values=(
+            username,
+            data["name"],
+            data["role"],
+            data["status"],
+            data["session_duration"],
+            data["last_activity"],
+            data["fire_count"]
+        ))
         
-        user_activity_tree.tag_configure("green", foreground="green")
-        user_activity_tree.tag_configure("red", foreground="red")
-        
-        conn.close()
-        
-    except Exception as e:
-        print(f"Kullanıcı aktiviteleri güncellenirken hata: {e}")
-        # Hata durumunda basit bir güncelleme yap
-        try:
-            for item in user_activity_tree.get_children():
-                user_activity_tree.delete(item)
-            
-            for username, user_info in users_db.items():
-                status = "Aktif" if username in active_users else "Çevrimdışı"
-                status_color = "green" if status == "Aktif" else "red"
-                
-                item = user_activity_tree.insert("", "end", values=(
-                    username,
-                    user_info["name"],
-                    user_info["role"],
-                    status,
-                    "N/A",
-                    "N/A",
-                    0
-                ))
-                
-                user_activity_tree.item(item, tags=(status_color,))
-            
-            user_activity_tree.tag_configure("green", foreground="green")
-            user_activity_tree.tag_configure("red", foreground="red")
-        except Exception as e2:
-            print(f"Basit güncelleme de başarısız: {e2}")
+        user_activity_tree.item(item, tags=(status_color,))
+    
+    user_activity_tree.tag_configure("green", foreground="green")
+    user_activity_tree.tag_configure("red", foreground="red")
+    
+    conn.close()
 
 # ===== DOSYA İŞLEMLERİ =====
 def clear_detection_history():
-    """Tespit geçmişini temizle"""
     global detection_history
     
-    # Sadece geçici hafızadaki verileri temizle
     detection_history.clear()
     
-    # Veritabanındaki verileri silme seçeneği sun
     if messagebox.askyesno("Veritabanı Temizleme", "Veritabanındaki tüm tespit geçmişini de silmek istiyor musunuz?"):
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
@@ -565,13 +508,10 @@ def clear_detection_history():
     update_history_tree()
 
 def clear_fire_history():
-    """Ateş geçmişini temizle"""
     global fire_history
     
-    # Sadece geçici hafızadaki verileri temizle
     fire_history.clear()
     
-    # Veritabanındaki verileri silme seçeneği sun
     if messagebox.askyesno("Veritabanı Temizleme", "Veritabanındaki tüm ateş geçmişini de silmek istiyor musunuz?"):
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
@@ -584,10 +524,29 @@ def clear_fire_history():
     
     update_fire_history_tree()
 
+def clear_user_activity_history():
+    """Kullanıcı aktivitelerini temizle"""
+    if messagebox.askyesno("Veritabanı Temizleme", "Veritabanındaki tüm kullanıcı aktivitelerini silmek istiyor musunuz?\n\nBu işlem geri alınamaz!"):
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM user_activities")
+            conn.commit()
+            conn.close()
+            
+            # Geçici hafızadaki verileri de temizle
+            global user_activities
+            user_activities.clear()
+            
+            messagebox.showinfo("Başarılı", "Tüm kullanıcı aktiviteleri temizlendi!")
+            
+            # Tabloyu güncelle
+            update_user_activity_tree()
+        except Exception as e:
+            messagebox.showerror("Hata", f"Kullanıcı aktiviteleri temizlenirken hata oluştu:\n{str(e)}")
+
 def export_to_excel():
-    """Raporu Excel dosyasına aktar"""
     try:
-        # Veritabanından tüm verileri al
         all_detections = get_all_detections_from_db()
         
         if not all_detections:
@@ -620,9 +579,7 @@ def export_to_excel():
         messagebox.showerror("Hata", f"Excel dosyası kaydedilirken hata oluştu:\n{str(e)}")
 
 def export_to_txt():
-    """Raporu TXT dosyasına aktar"""
     try:
-        # Veritabanından tüm verileri al
         all_detections = get_all_detections_from_db()
         
         if not all_detections:
@@ -659,9 +616,7 @@ def export_to_txt():
         messagebox.showerror("Hata", f"TXT dosyası kaydedilirken hata oluştu:\n{str(e)}")
 
 def export_fire_history_to_excel():
-    """Ateş geçmişini Excel dosyasına aktar"""
     try:
-        # Veritabanından tüm verileri al
         all_fire_events = get_all_fire_history_from_db()
         
         if not all_fire_events:
@@ -712,9 +667,7 @@ def export_fire_history_to_excel():
         messagebox.showerror("Hata", f"Excel dosyası kaydedilirken hata oluştu:\n{str(e)}")
 
 def export_fire_history_to_txt():
-    """Ateş geçmişini TXT dosyasına aktar"""
     try:
-        # Veritabanından tüm verileri al
         all_fire_events = get_all_fire_history_from_db()
         
         if not all_fire_events:
@@ -755,7 +708,6 @@ def export_fire_history_to_txt():
         messagebox.showerror("Hata", f"TXT dosyası kaydedilirken hata oluştu:\n{str(e)}")
 
 def export_user_activity_to_excel():
-    """Kullanıcı aktivitelerini Excel dosyasına aktar"""
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
@@ -782,7 +734,6 @@ def export_user_activity_to_excel():
         if filename:
             export_data = []
             
-            # Kullanıcı oturumlarını hesapla
             user_sessions = {}
             
             for activity in activities:
@@ -806,7 +757,6 @@ def export_user_activity_to_excel():
                         "fire_count": 0
                     })
                 elif activity_type == "logout" and user_sessions[username]["sessions"]:
-                    # Son oturumu bul
                     for session in reversed(user_sessions[username]["sessions"]):
                         if session["logout_time"] is None:
                             session["logout_time"] = timestamp
@@ -814,13 +764,11 @@ def export_user_activity_to_excel():
                 elif activity_type == "fire":
                     user_sessions[username]["fire_commands"].append(timestamp)
                     
-                    # Aktif oturuma ateş sayısını ekle
                     for session in reversed(user_sessions[username]["sessions"]):
                         if session["logout_time"] is None or (session["login_time"] <= timestamp <= session["logout_time"]):
                             session["fire_count"] += 1
                             break
             
-            # Verileri hazırla
             for username, data in user_sessions.items():
                 for session in data["sessions"]:
                     export_data.append({
@@ -849,23 +797,20 @@ def export_user_activity_to_excel():
         messagebox.showerror("Hata", f"Excel dosyası kaydedilirken hata oluştu:\n{str(e)}")
 
 def calculate_duration(start_time_str, end_time_str):
-    """İki zaman damgası arasındaki süreyi hesapla"""
     try:
-        start_time = parse_timestamp(start_time_str)
-        if start_time is None:
-            return "Hesaplanamadı"
+        start_time = datetime.strptime(start_time_str, '%Y-%m-%d %H:%M:%S.%f')
         
         if end_time_str is None:
             end_time = datetime.now()
         else:
-            end_time = parse_timestamp(end_time_str)
-            if end_time is None:
-                end_time = datetime.now()
+            end_time = datetime.strptime(end_time_str, '%Y-%m-%d %H:%M:%S.%f')
         
         duration = end_time - start_time
-        return format_duration(duration.total_seconds())
-    except Exception as e:
-        print(f"Süre hesaplama hatası: {e}")
+        hours, remainder = divmod(duration.total_seconds(), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        return f"{int(hours)}s {int(minutes)}d {int(seconds)}s"
+    except:
         return "Hesaplanamadı"
 
 # ===== SİSTEM FONKSİYONLARI =====
@@ -874,7 +819,6 @@ def play_alert():
         pygame.mixer.music.play()
 
 def start_server():
-    """TCP sunucusunu başlat"""
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind((SERVER_HOST, SERVER_PORT))
@@ -883,7 +827,6 @@ def start_server():
     print(f"Sunucu {SERVER_HOST}:{SERVER_PORT} adresinde başlatıldı...")
     
     def handle_client(client_socket, client_address):
-        """İstemci bağlantılarını yönet"""
         print(f"Yeni bağlantı: {client_address}")
         connected_clients.append(client_socket)
         current_user = None
@@ -895,7 +838,6 @@ def start_server():
                     if data:
                         message = json.loads(data)
                         
-                        # Giriş bilgisi kontrolü
                         if message.get("type") == "login":
                             username = message.get("username")
                             password = message.get("password")
@@ -910,7 +852,6 @@ def start_server():
                                 }
                                 active_users[username] = current_user
                                 
-                                # Kullanıcı aktivitesini veritabanına kaydet
                                 save_user_activity_to_db(
                                     username, 
                                     "login", 
@@ -928,7 +869,8 @@ def start_server():
                                 user_activities[username]["login_times"].append(message.get("timestamp"))
                                 print(f"Kullanıcı giriş yaptı: {username} (Rol: {users_db[username]['role']})")
                                 
-                                # Client'a başarılı giriş yanıtı gönder
+                                window.after(0, update_user_activity_tree)
+                                
                                 response = {
                                     "type": "login_response",
                                     "success": True,
@@ -943,7 +885,6 @@ def start_server():
                             else:
                                 print(f"Geçersiz kullanıcı girişi denemesi: {username}")
                                 
-                                # Client'a başarısız giriş yanıtı gönder
                                 response = {
                                     "type": "login_response",
                                     "success": False,
@@ -951,13 +892,11 @@ def start_server():
                                 }
                                 client_socket.send((json.dumps(response) + "\n").encode('utf-8'))
                         
-                        # Çıkış bilgisi
                         elif message.get("type") == "logout":
                             username = message.get("username")
                             if username in active_users:
                                 logout_time = message.get("timestamp")
                                 
-                                # Kullanıcı aktivitesini veritabanına kaydet
                                 save_user_activity_to_db(
                                     username, 
                                     "logout", 
@@ -970,13 +909,13 @@ def start_server():
                                 
                                 del active_users[username]
                                 print(f"Kullanıcı çıkış yaptı: {username}")
+                                
+                                window.after(0, update_user_activity_tree)
                         
-                        # Ateş emri kontrolü
                         elif message.get("command") == "FIRE":
                             username = message.get("user", "unknown")
                             print(f"ATEŞ EMRİ alındı - Kullanıcı: {username}, İstemci: {client_address}")
                             
-                            # Kullanıcının ateş etme yetkisi var mı kontrol et
                             fire_success = False
                             if username in users_db:
                                 role = users_db[username]["role"]
@@ -993,7 +932,6 @@ def start_server():
                                 "drones": []
                             }
                             
-                            # Kullanıcı aktivitesini veritabanına kaydet
                             save_user_activity_to_db(
                                 username, 
                                 "fire", 
@@ -1029,7 +967,6 @@ def start_server():
                             if len(fire_history) > max_fire_history:
                                 fire_history.pop(0)
                             
-                            # Ateş olayını veritabanına kaydet
                             save_fire_to_db(fire_entry)
                             
                             response = {
@@ -1057,7 +994,6 @@ def start_server():
                 username = current_user["username"]
                 logout_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
                 
-                # Kullanıcı aktivitesini veritabanına kaydet
                 save_user_activity_to_db(
                     username, 
                     "logout", 
@@ -1070,14 +1006,15 @@ def start_server():
                 
                 del active_users[username]
                 print(f"Kullanıcı bağlantısı kesildi: {username}")
-            
+                
+                window.after(0, update_user_activity_tree)
+        
             if client_socket in connected_clients:
                 connected_clients.remove(client_socket)
             client_socket.close()
             print(f"Bağlantı kesildi: {client_address}")
     
     def accept_connections():
-        """Yeni bağlantıları kabul et"""
         while True:
             try:
                 client_socket, client_address = server_socket.accept()
@@ -1097,7 +1034,6 @@ def start_server():
     accept_thread.start()
 
 def broadcast_drone_data():
-    """Drone verilerini tüm istemcilere gönder"""
     if not connected_clients:
         return
     
@@ -1116,20 +1052,16 @@ window = tk.Tk()
 window.title("Drone Tespit Server - Raporlar")
 window.geometry("1400x900")
 
-# Ana çerçeve
 main_frame = tk.Frame(window)
 main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-# Üst kısım - Sistem Durumu
 status_frame = tk.LabelFrame(main_frame, text="Sistem Durumu", font=("Arial", 14, "bold"), height=120)
 status_frame.pack(fill=tk.X, pady=(0, 10))
 status_frame.pack_propagate(False)
 
-# Durum bilgileri için grid layout
 status_grid = tk.Frame(status_frame)
 status_grid.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-# Sol kolon - Server bilgileri
 left_status = tk.Frame(status_grid)
 left_status.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -1143,7 +1075,6 @@ client_count_label.pack(anchor="w")
 system_time_label = tk.Label(left_status, text="", font=("Arial", 11))
 system_time_label.pack(anchor="w")
 
-# Orta kolon - Tespit durumu
 middle_status = tk.Frame(status_grid)
 middle_status.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=20)
 
@@ -1157,7 +1088,6 @@ active_drones_label.pack(anchor="w")
 last_detection_label = tk.Label(middle_status, text="Son Tespit: -", font=("Arial", 11))
 last_detection_label.pack(anchor="w")
 
-# Sağ kolon - Sistem kontrolleri
 right_status = tk.Frame(status_grid)
 right_status.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
@@ -1173,15 +1103,12 @@ alert_system_label = tk.Label(right_status, text="Alarm Sistemi: Hazır",
                              font=("Arial", 11), fg="green")
 alert_system_label.pack(anchor="w")
 
-# Ana içerik alanı - Notebook için
 content_frame = tk.Frame(main_frame)
 content_frame.pack(fill=tk.BOTH, expand=True)
 
-# Notebook (sekmeli arayüz)
 notebook = ttk.Notebook(content_frame)
 notebook.pack(fill=tk.BOTH, expand=True)
 
-# Sekme 1: Anlık Tespitler
 current_frame = tk.Frame(notebook)
 notebook.add(current_frame, text="Anlık Tespitler")
 
@@ -1213,7 +1140,6 @@ for col, width in columns_config:
 
 current_tree.pack(fill=tk.BOTH, expand=True)
 
-# Sekme 2: Tespit Geçmişi
 history_frame = tk.Frame(notebook)
 notebook.add(history_frame, text="Tespit Geçmişi")
 
@@ -1261,7 +1187,6 @@ for col, width in history_columns_config:
 
 history_tree.pack(fill=tk.BOTH, expand=True)
 
-# Sekme 3: İstatistikler
 stats_frame = tk.Frame(notebook)
 notebook.add(stats_frame, text="İstatistikler")
 
@@ -1286,7 +1211,6 @@ for i in range(2):
 for i in range(3):
     stats_grid.grid_columnconfigure(i, weight=1)
 
-# Sekme 4: Ateş Geçmişi
 fire_history_frame = tk.Frame(notebook)
 notebook.add(fire_history_frame, text="Ateş Geçmişi")
 
@@ -1335,25 +1259,19 @@ for col, width in fire_history_columns_config:
 
 fire_history_tree.pack(fill=tk.BOTH, expand=True)
 
-# Sekme 5: Kullanıcı Aktiviteleri
 user_activity_frame = tk.Frame(notebook)
 notebook.add(user_activity_frame, text="Kullanıcı Aktiviteleri")
 
 user_activity_controls = tk.Frame(user_activity_frame)
 user_activity_controls.pack(fill=tk.X, padx=10, pady=5)
 
-def refresh_user_activity():
-    """Kullanıcı aktivitelerini yenile - debug için"""
-    print("Yenile butonu tıklandı")
-    try:
-        update_user_activity_tree()
-        print("Kullanıcı aktiviteleri başarıyla güncellendi")
-    except Exception as e:
-        print(f"Yenile butonu hatası: {e}")
-
 refresh_user_activity_btn = tk.Button(user_activity_controls, text="Yenile", 
-                                     command=refresh_user_activity)
+                                     command=update_user_activity_tree)
 refresh_user_activity_btn.pack(side=tk.LEFT)
+
+clear_user_activity_btn = tk.Button(user_activity_controls, text="Geçmişi Temizle", 
+                                   command=clear_user_activity_history)
+clear_user_activity_btn.pack(side=tk.LEFT, padx=(10, 0))
 
 export_user_activity_btn = tk.Button(user_activity_controls, text="Excel'e Aktar", 
                                     command=export_user_activity_to_excel)
@@ -1392,7 +1310,6 @@ user_activity_tree.pack(fill=tk.BOTH, expand=True)
 cap = cv2.VideoCapture(0)
 
 def background_detection():
-    """Arka planda drone tespiti yap"""
     global current_drone_data, detection_history
     
     ret, frame = cap.read()
@@ -1499,10 +1416,7 @@ def background_detection():
                 "display_y": display_y
             }
             
-            # Geçici hafızaya ekle
             detection_history.append(history_entry)
-            
-            # Veritabanına kaydet
             save_detection_to_db(history_entry)
         
         if len(detection_history) > max_history:
@@ -1527,31 +1441,24 @@ def background_detection():
 
 # ===== SİSTEMİ BAŞLATMA =====
 def update_system_time():
-    """Sistem zamanını güncelle"""
     system_time_label.config(text=f"Sistem Zamanı: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     window.after(1000, update_system_time)
 
 def update_client_count():
-    """Bağlı istemci sayısını güncelle"""
     client_count_label.config(text=f"Bağlı İstemci: {len(connected_clients)}")
     window.after(1000, update_client_count)
 
-# Sunucuyu başlat
 start_server()
 
-# Arka plan tespiti başlat
 def detection_loop():
     background_detection()
     window.after(100, detection_loop)
 
-# Sistem güncellemelerini başlat
 update_system_time()
 update_client_count()
 detection_loop()
 
-# Arayüzü göster
 window.mainloop()
 
-# Kaynakları serbest bırak
 cap.release()
 cv2.destroyAllWindows()
