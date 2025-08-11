@@ -468,14 +468,24 @@ def update_fire_history_tree():
     display_events = all_fire_events[:1000]
     
     for fire_event in display_events:
+        # client_id yerine user bilgisini kullan
+        user_info = fire_event.get("user", fire_event.get("client_id", "Bilinmiyor"))
+        
         for drone in fire_event["drones"]:
             result_text = "Başarılı" if fire_event["success"] else "Başarısız"
             result_color = "green" if fire_event["success"] else "red"
             
+            # drone['id'] integer kontrolü
+            drone_id = drone.get('id', '?')
+            if isinstance(drone_id, (int, float)):
+                drone_id_formatted = f"D{int(drone_id):03d}"
+            else:
+                drone_id_formatted = str(drone_id)
+            
             item = fire_history_tree.insert("", "end", values=(
                 fire_event["timestamp"],
-                fire_event["client_id"],
-                f"D{drone['id']:03d}",
+                user_info,  # client_id yerine user_info kullan
+                drone_id_formatted,
                 drone["zone"],
                 f"{drone['confidence']:.1f}%",
                 f"{drone['x_coord']:.2f}",
@@ -487,7 +497,6 @@ def update_fire_history_tree():
     
     fire_history_tree.tag_configure("green", foreground="green")
     fire_history_tree.tag_configure("red", foreground="red")
-
 def update_user_activity_tree():
     for item in user_activity_tree.get_children():
         user_activity_tree.delete(item)
@@ -700,6 +709,13 @@ def export_fire_history_to_excel():
     try:
         all_fire_events = get_all_fire_history_from_db()
         
+        # Hafızadaki kayıtları da ekle
+        for fire_event in fire_history:
+            exists = any(db_event["timestamp"] == fire_event["timestamp"] 
+                        for db_event in all_fire_events)
+            if not exists:
+                all_fire_events.append(fire_event)
+        
         if not all_fire_events:
             messagebox.showwarning("Uyarı", "Dışa aktarılacak veri bulunmuyor!")
             return
@@ -707,21 +723,31 @@ def export_fire_history_to_excel():
         filename = filedialog.asksaveasfilename(
             defaultextension=".xlsx",
             filetypes=[("Excel dosyası", "*.xlsx"), ("Tüm dosyalar", "*.*")],
-            initialfile=f"fire_history_{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}.xlsx"
+            initialfile=f"fire_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         )
         
         if filename:
             export_data = []
             for fire_event in all_fire_events:
+                # client_id yerine user bilgisini kullan
+                user_info = fire_event.get("user", fire_event.get("client_id", "Bilinmiyor"))
+                
                 for drone in fire_event["drones"]:
+                    # drone['id'] kontrolü ve formatlaması
+                    drone_id = drone.get('id', '?')
+                    if isinstance(drone_id, (int, float)):
+                        drone_id_formatted = f"D{int(drone_id):03d}"
+                    else:
+                        drone_id_formatted = str(drone_id)
+                    
                     export_data.append({
                         "Tarih": fire_event["timestamp"],
-                        "İstemci": fire_event["client_id"],
-                        "Drone ID": f"D{drone['id']:03d}",
-                        "Bölge": drone["zone"],
-                        "Güven (%)": drone["confidence"],
-                        "X Ekseni": drone["x_coord"],
-                        "Y Ekseni": drone["y_coord"],
+                        "Kullanıcı": user_info,  # İstemci yerine Kullanıcı
+                        "Drone ID": drone_id_formatted,
+                        "Bölge": drone.get("zone", "Bilinmiyor"),
+                        "Güven (%)": round(drone.get("confidence", 0), 1),
+                        "X Ekseni": round(drone.get("x_coord", 0), 2),
+                        "Y Ekseni": round(drone.get("y_coord", 0), 2),
                         "Sonuç": "Başarılı" if fire_event["success"] else "Başarısız"
                     })
             
@@ -730,12 +756,13 @@ def export_fire_history_to_excel():
             with pd.ExcelWriter(filename, engine='openpyxl') as writer:
                 df.to_excel(writer, sheet_name='Ateş Geçmişi', index=False)
                 worksheet = writer.sheets['Ateş Geçmişi']
-                column_widths = [20, 12, 12, 15, 12, 12, 12, 15]
+                column_widths = [20, 15, 12, 15, 12, 12, 12, 15]
                 for i, width in enumerate(column_widths, 1):
                     worksheet.column_dimensions[chr(64+i)].width = width
                 for cell in worksheet[1]:
                     cell.font = cell.font.copy(bold=True)
                 
+                # Sonuç sütununu renklendirme
                 for row in range(2, len(export_data) + 2):
                     result_cell = worksheet.cell(row=row, column=8)
                     if result_cell.value == "Başarılı":
@@ -745,11 +772,19 @@ def export_fire_history_to_excel():
             
             messagebox.showinfo("Başarılı", f"Ateş geçmişi başarıyla Excel dosyasına kaydedildi:\n{filename}")
     except Exception as e:
+        print(f"Excel export hatası detayı: {e}")
         messagebox.showerror("Hata", f"Excel dosyası kaydedilirken hata oluştu:\n{str(e)}")
 
 def export_fire_history_to_txt():
     try:
         all_fire_events = get_all_fire_history_from_db()
+        
+        # Hafızadaki kayıtları da ekle
+        for fire_event in fire_history:
+            exists = any(db_event["timestamp"] == fire_event["timestamp"] 
+                        for db_event in all_fire_events)
+            if not exists:
+                all_fire_events.append(fire_event)
         
         if not all_fire_events:
             messagebox.showwarning("Uyarı", "Dışa aktarılacak veri bulunmuyor!")
@@ -758,36 +793,46 @@ def export_fire_history_to_txt():
         filename = filedialog.asksaveasfilename(
             defaultextension=".txt",
             filetypes=[("Metin dosyası", "*.txt"), ("Tüm dosyalar", "*.*")],
-            initialfile=f"fire_history_{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}.txt"
+            initialfile=f"fire_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         )
         
         if filename:
             with open(filename, 'w', encoding='utf-8') as f:
                 f.write("DRONE ATEŞ GEÇMİŞİ\n")
-                f.write("="*80 + "\n")
-                f.write(f"Rapor Tarihi: {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}\n")
-                f.write(f"Toplam Ateş: {len(all_fire_events)}\n\n")
+                f.write("="*95 + "\n")
+                f.write(f"Rapor Tarihi: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Toplam Ateş Olayı: {len(all_fire_events)}\n\n")
                 
-                f.write(f"{'Tarih':<20} {'İstemci':<12} {'ID':<8} {'Bölge':<15} {'Güven':<8} {'X Eks':<8} {'Y Eks':<8} {'Sonuç':<12}\n")
+                f.write(f"{'Tarih':<20} {'Kullanıcı':<12} {'ID':<8} {'Bölge':<15} {'Güven':<8} {'X Eks':<8} {'Y Eks':<8} {'Sonuç':<12}\n")
                 f.write("-" * 95 + "\n")
                 
                 for fire_event in all_fire_events:
+                    # client_id yerine user bilgisini kullan
+                    user_info = fire_event.get("user", fire_event.get("client_id", "Bilinmiyor"))
+                    
                     for drone in fire_event["drones"]:
                         result_text = "Başarılı" if fire_event["success"] else "Başarısız"
-                        drone_id_formatted = f"D{drone['id']:03d}"
+                        
+                        # drone['id'] kontrolü ve formatlaması
+                        drone_id = drone.get('id', '?')
+                        if isinstance(drone_id, (int, float)):
+                            drone_id_formatted = f"D{int(drone_id):03d}"
+                        else:
+                            drone_id_formatted = str(drone_id)
+                        
                         f.write(f"{fire_event['timestamp']:<20} ")
-                        f.write(f"{fire_event['client_id']:<12} ")
+                        f.write(f"{user_info[:12]:<12} ")  # Kullanıcı ismini 12 karakterle sınırla
                         f.write(f"{drone_id_formatted:<8} ")
-                        f.write(f"{drone['zone']:<15} ")
-                        f.write(f"{drone['confidence']:<8.1f} ")
-                        f.write(f"{drone['x_coord']:<8.2f} ")
-                        f.write(f"{drone['y_coord']:<8.2f} ")
+                        f.write(f"{drone.get('zone', 'Bilinmiyor')[:15]:<15} ")
+                        f.write(f"{drone.get('confidence', 0):<8.1f} ")
+                        f.write(f"{drone.get('x_coord', 0):<8.2f} ")
+                        f.write(f"{drone.get('y_coord', 0):<8.2f} ")
                         f.write(f"{result_text:<12}\n")
             
             messagebox.showinfo("Başarılı", f"Ateş geçmişi başarıyla TXT dosyasına kaydedildi:\n{filename}")
     except Exception as e:
+        print(f"TXT export hatası detayı: {e}")
         messagebox.showerror("Hata", f"TXT dosyası kaydedilirken hata oluştu:\n{str(e)}")
-
 def export_user_activity_to_excel():
     try:
         conn = sqlite3.connect(db_path)
