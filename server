@@ -1046,7 +1046,7 @@ def start_server():
                             if username in users_db:
                                 role = users_db[username]["role"]
                                 if role in ["admin", "yonetici", "operator"]:
-                                    fire_success = random.choice([True, False])
+                                    fire_success = random.choice([True, False,True])
                                 else:
                                     print(f"Kullanıcı {username} ateş etme yetkisine sahip değil: {role}")
                             
