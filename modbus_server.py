@@ -1,0 +1,1712 @@
+import cv2
+from ultralytics import YOLO
+import pygame
+import tkinter as tk
+from tkinter import ttk
+from datetime import datetime
+from PIL import Image, ImageTk
+import numpy as np
+import socket
+import threading
+import json
+import time
+import pandas as pd
+from tkinter import filedialog, messagebox
+import random
+import os
+import sqlite3
+MODBUS_HOST = "127.0.0.1"
+MODBUS_PORT = 5020  # test.exe buraya bağlanacak
+
+THREAT_MAP = {
+    "YOK": 0,
+    "DUSUK": 1,
+    "ORTA SEVIYE": 2,
+    "ORTA SEVİYE": 2,      # Türkçe İ/İS harfi varyasyonları
+    "YUKSEK TEHLIKE": 3,
+    "YUKSEK TEHLİKE": 3,
+}
+
+ZONE_MAP = {
+    "MERKEZ": 0,
+    "KUZEY": 1,
+    "GUNEY": 2, "GÜNEY": 2,
+    "DOGU": 3,  "DOĞU": 3,
+    "BATI": 4,
+    "KUZEYDOGU": 5, "KUZEYDOĞU": 5,
+    "KUZEYBATI": 6,
+    "GUNEYDOGU": 7, "GÜNEYDOĞU": 7,
+    "GUNEYBATI": 8, "GÜNEYBATI": 8,
+}
+
+def u16(val):
+    """signed 16-bit -> unsigned 16-bit (two's complement)"""
+    return val & 0xFFFF
+
+# === MODBUS EKLEME ===
+try:
+    from pymodbus.server.sync import StartTcpServer
+    from pymodbus.client.sync import ModbusTcpClient
+except Exception:
+    # pymodbus 3.x
+    from pymodbus.server import StartTcpServer
+    from pymodbus.client import ModbusTcpClient
+
+from pymodbus.datastore import ModbusSlaveContext, ModbusServerContext
+from pymodbus.datastore.store import ModbusSequentialDataBlock
+
+# Model ve ses dosyası yolları
+model_path = r"C:\Users\yaren\OneDrive\Masaüstü\drone_dataset\runs\detect\train\weights\best.pt"
+sound_path = r"C:\Users\yaren\OneDrive\Masaüstü\drone_dataset\alert.wav"
+json_path = r"C:\Users\yaren\OneDrive\Masaüstü\drone_dataset\kullanici_bilgileri.json"
+db_path = "tespit_gecmisi.db"
+
+# Modeli yükle
+try:
+    model = YOLO(model_path)
+    print("AI Model başarıyla yüklendi")
+except Exception as e:
+    print(f"Model yükleme hatası: {e}")
+    model = None
+
+# Pygame ses sistemi başlat
+pygame.init()
+pygame.mixer.init()
+try:
+    pygame.mixer.music.load(sound_path)
+    print("Ses dosyası başarıyla yüklendi")
+except Exception as e:
+    print(f"Ses dosyası yükleme hatası: {e}")
+
+# TCP Server ayarları
+SERVER_HOST = '127.0.0.1'
+SERVER_PORT = 8888
+connected_clients = []
+
+# Global değişkenler
+current_drone_data = {
+    "drone_count": 0,
+    "threat_level": "YOK",
+    "detections": [],
+    "timestamp": "",
+    "fire_authorized": False
+}
+
+detection_history = []
+max_history = 1000
+fire_history = []
+max_fire_history = 1000
+user_activities = {}
+active_users = {}
+# === MODBUS REGISTER GÜNCELLEME ===
+def update_modbus_registers():
+    """current_drone_data -> Holding Registers [0..9] günceller."""
+    while True:
+        try:
+            client = ModbusTcpClient(MODBUS_HOST, port=MODBUS_PORT)
+            if not client.connect():
+                time.sleep(1)
+                continue
+
+            # 0: drone_count
+            drone_count = int(current_drone_data.get("drone_count", 0))
+
+            # 1: threat_level (string -> kod)
+            tl_str = current_drone_data.get("threat_level", "YOK")
+            threat_level = THREAT_MAP.get(tl_str, 0)
+
+            # 2: fire_authorized (0/1)
+            fire_authorized = 1 if current_drone_data.get("fire_authorized", False) else 0
+
+            # Varsayılanlar
+            detection_id = 0
+            confidence = 0
+            map_x = 0
+            map_y = 0
+            zone_code = 0
+
+            detections = current_drone_data.get("detections", [])
+            if detections:
+                d = detections[0]
+                pos = d.get("position", {})
+                detection_id = int(d.get("id", 0))
+
+                # 4: confidence (0-1000) -> senin verin 0-1 ise x100
+                # C++ tarafı %1=10 olacak şekilde bekliyor: orada "%.1f%%" yazdırıyor. :contentReference[oaicite:8]{index=8}
+                confidence = int(float(d.get("confidence", 0.0)) * 1000)  # örn. 0.873 -> 873
+
+                # 5/6: pozisyonlar x1000 (signed -> u16)
+                map_x = int(float(pos.get("map_x", 0.0)) * 1000)
+                map_y = int(float(pos.get("map_y", 0.0)) * 1000)
+
+                # 7: zone_code (string -> kod)
+                zone_str = pos.get("zone")
+                if zone_str is None:
+                    # elindeki yardımcı yön fonksiyonun varsa onu kullanabilirsin
+                    try:
+                        from math import copysign
+                        # display_x/display_y hesapların varsa onlardan yön çıkarılabilir;
+                        # şimdilik bilinmiyorsa 0 (MERKEZ) kalır.
+                    except Exception:
+                        pass
+                zone_code = ZONE_MAP.get(zone_str, 0)
+
+            # 8/9: Unix timestamp (yüksek/düşük 16 bit)
+            ts = int(time.time())
+            ts_hi = (ts >> 16) & 0xFFFF
+            ts_lo = ts & 0xFFFF
+
+            # Yazımlar (adres 0..9)
+            client.write_register(0, drone_count)
+            client.write_register(1, threat_level)
+            client.write_register(2, fire_authorized)
+            client.write_register(3, detection_id)
+            client.write_register(4, confidence)
+            client.write_register(5, u16(map_x))
+            client.write_register(6, u16(map_y))
+            client.write_register(7, zone_code)
+            client.write_register(8, ts_hi)
+            client.write_register(9, ts_lo)
+
+            client.close()
+        except Exception as e:
+            print(f"Modbus güncelleme hatası: {e}")
+
+        time.sleep(1)
+# === MODBUS SERVER BAŞLATMA ===
+def setup_modbus_server():
+    store = ModbusSlaveContext(
+        hr=ModbusSequentialDataBlock(0, [0]*100)
+    )
+    context = ModbusServerContext(slaves=store, single=True)
+    StartTcpServer(context, address=("0.0.0.0", 5020))
+# ===== VERİTABANI FONKSİYONLARI =====
+def init_db():
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    # Mevcut tablo oluşturma kodları...
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS detection_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        drone_id TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        zone TEXT NOT NULL,
+        threat_level TEXT NOT NULL,
+        display_x REAL NOT NULL,
+        display_y REAL NOT NULL
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS fire_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        drone_id TEXT NOT NULL,
+        zone TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        x_coord REAL NOT NULL,
+        y_coord REAL NOT NULL,
+        success INTEGER NOT NULL
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS user_activities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        activity_type TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        details TEXT
+    )
+    ''')
+    
+    # PERFORMANS İÇİN İNDEKSLER EKLE
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_detection_timestamp ON detection_history(timestamp)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_fire_timestamp ON fire_history(timestamp)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_timestamp ON user_activities(timestamp)')
+    
+    conn.commit()
+    conn.close()
+    print("Veritabanı ve indeksler başarıyla oluşturuldu")
+def save_detection_to_db(detection):
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    INSERT INTO detection_history 
+    (timestamp, drone_id, confidence, zone, threat_level, display_x, display_y)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        detection["timestamp"],
+        detection["id"],
+        detection["confidence"],
+        detection["zone"],
+        detection["threat_level"],
+        detection["display_x"],
+        detection["display_y"]
+    ))
+    
+    conn.commit()
+    conn.close()
+
+def save_fire_to_db(fire_event):
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    for drone in fire_event["drones"]:
+        cursor.execute('''
+        INSERT INTO fire_history 
+        (timestamp, client_id, drone_id, zone, confidence, x_coord, y_coord, success)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            fire_event["timestamp"],
+            fire_event["client_id"],
+            drone["id"],
+            drone["zone"],
+            drone["confidence"],
+            drone["x_coord"],
+            drone["y_coord"],
+            1 if fire_event["success"] else 0
+        ))
+    
+    conn.commit()
+    conn.close()
+
+def save_user_activity_to_db(username, activity_type, timestamp, details=None):
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    INSERT INTO user_activities 
+    (username, activity_type, timestamp, details)
+    VALUES (?, ?, ?, ?)
+    ''', (username, activity_type, timestamp, details))
+    
+    conn.commit()
+    conn.close()
+
+def get_all_detections_from_db():
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    SELECT timestamp, drone_id, confidence, zone, threat_level, display_x, display_y
+    FROM detection_history
+    ORDER BY timestamp DESC               
+    ''')
+    
+    detections = []
+    for row in cursor.fetchall():
+        detections.append({
+            "timestamp": row[0],
+            "id": row[1],
+            "confidence": row[2],
+            "zone": row[3],
+            "threat_level": row[4],
+            "display_x": row[5],
+            "display_y": row[6]
+        })
+    
+    conn.close()
+    return detections
+
+def get_all_fire_history_from_db():
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    SELECT timestamp, client_id, drone_id, zone, confidence, x_coord, y_coord, success
+    FROM fire_history
+    ORDER BY timestamp DESC
+    ''')
+    
+    fire_events = {}
+    for row in cursor.fetchall():
+        timestamp = row[0]
+        if timestamp not in fire_events:
+            fire_events[timestamp] = {
+                "timestamp": timestamp,
+                "client_id": row[1],
+                "success": bool(row[7]),
+                "drones": []
+            }
+        
+        fire_events[timestamp]["drones"].append({
+            "id": row[2],
+            "zone": row[3],
+            "confidence": row[4],
+            "x_coord": row[5],
+            "y_coord": row[6]
+        })
+    
+    conn.close()
+    return list(fire_events.values())
+def get_detections_paginated(page=1, per_page=1000):
+    """Sayfalama ile tespit verilerini getir"""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    offset = (page - 1) * per_page
+    
+    cursor.execute('''
+    SELECT timestamp, drone_id, confidence, zone, threat_level, display_x, display_y
+    FROM detection_history
+    ORDER BY timestamp DESC
+    LIMIT ? OFFSET ?
+    ''', (per_page, offset))
+    
+    detections = []
+    for row in cursor.fetchall():
+        detections.append({
+            "timestamp": row[0],
+            "id": row[1],
+            "confidence": row[2],
+            "zone": row[3],
+            "threat_level": row[4],
+            "display_x": row[5],
+            "display_y": row[6]
+        })
+    
+    # Toplam kayıt sayısını da al
+    cursor.execute('SELECT COUNT(*) FROM detection_history')
+    total_count = cursor.fetchone()[0]
+    
+    conn.close()
+    return detections, total_count
+# Veritabanını başlat
+init_db()
+
+# ===== KULLANICI YÖNETİMİ FONKSİYONLARI =====
+def load_users_from_json():
+    users_db = {}
+    
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            user_list = json.load(f)
+            
+        for user in user_list:
+            username = user.get("kullanici_adi")
+            password = user.get("kullanici_sifre")
+            role = user.get("kullanici_yetkisi")
+            
+            if username and password and role:
+                users_db[username] = {
+                    "password": password,
+                    "name": username,
+                    "role": role
+                }
+        
+        print(f"Sunucu: {len(users_db)} kullanıcı başarıyla yüklendi")
+        return users_db
+        
+    except FileNotFoundError:
+        print(f"Sunucu Hatası: {json_path} dosyası bulunamadı")
+        return {}
+    except json.JSONDecodeError:
+        print(f"Sunucu Hatası: {json_path} geçersiz JSON formatı")
+        return {}
+    except Exception as e:
+        print(f"Sunucu Beklenmeyen Hata: {str(e)}")
+        return {}
+
+users_db = load_users_from_json()
+
+# ===== YÖN FONKSİYONLARI =====
+def get_direction_from_coordinates(x, y):
+    tolerance = 0.1
+    
+    if abs(x) <= tolerance and abs(y) <= tolerance:
+        return "MERKEZ"
+    
+    if abs(x) <= tolerance:
+        return "KUZEY" if y > 0 else "GÜNEY"
+    elif abs(y) <= tolerance:
+        return "DOĞU" if x > 0 else "BATI"
+    else:
+        if x > 0 and y > 0:
+            return "KUZEYDOĞU"
+        elif x < 0 and y > 0:
+            return "KUZEYBATI"
+        elif x < 0 and y < 0:
+            return "GÜNEYBATI"
+        else:
+            return "GÜNEYDOĞU"
+
+# ===== OTURUM SÜRESİ HESAPLAMA =====
+def calculate_session_duration(activities, username, is_active):
+    user_activities = [act for act in activities if act[0] == username]
+    
+    if not user_activities:
+        return "N/A"
+    
+    user_activities.sort(key=lambda x: x[2])
+    
+    sessions = []
+    current_login = None
+    
+    for activity in user_activities:
+        activity_type = activity[1]
+        timestamp = activity[2]
+        
+        if activity_type == "login":
+            if current_login is not None:
+                sessions.append((current_login, timestamp))
+            current_login = timestamp
+        elif activity_type == "logout":
+            if current_login is not None:
+                sessions.append((current_login, timestamp))
+                current_login = None
+    
+    if current_login is not None and is_active:
+        login_time = datetime.strptime(current_login, '%Y-%m-%d %H:%M:%S.%f')
+        now = datetime.now()
+        duration = now - login_time
+        hours, remainder = divmod(duration.total_seconds(), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{int(hours)}s {int(minutes)}d {int(seconds)}s"
+    
+    if sessions:
+        last_session = sessions[-1]
+        login_time = datetime.strptime(last_session[0], '%Y-%m-%d %H:%M:%S.%f')
+        logout_time = datetime.strptime(last_session[1], '%Y-%m-%d %H:%M:%S.%f')
+        duration = logout_time - login_time
+        hours, remainder = divmod(duration.total_seconds(), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{int(hours)}s {int(minutes)}d {int(seconds)}s"
+    
+    return "N/A"
+
+# ===== ARAYÜZ GÜNCELLEME FONKSİYONLARI =====
+def update_current_tree():
+    for item in current_tree.get_children():
+        current_tree.delete(item)
+    
+    for detection in current_drone_data.get("detections", []):
+        pos = detection["position"]
+        
+        normalized_x = -((pos.get("map_x", 0.5) * 2) - 1)
+        normalized_y = -((pos.get("map_y", 0.5) * 2) - 1)
+        
+        zone_name = get_direction_from_coordinates(normalized_x, normalized_y)
+        
+        current_tree.insert("", "end", values=(
+            f"D{detection['id']:03d}",
+            current_drone_data.get("threat_level", "YOK"),
+            f"{detection['confidence']:.1f}%",
+            zone_name,
+            f"{normalized_x:.2f}",
+            f"{normalized_y:.2f}"
+        ))
+
+def update_history_tree():
+    for item in history_tree.get_children():
+        history_tree.delete(item)
+    
+    all_detections = detection_history + get_all_detections_from_db()
+    
+    for detection in detection_history:
+        exists = any(db_detection["timestamp"] == detection["timestamp"] and 
+                    db_detection["id"] == detection["id"]
+                    for db_detection in all_detections)
+        if not exists:
+            all_detections.append(detection)
+    all_detections.sort(key=lambda x: x["timestamp"], reverse=True)
+    display_detections = all_detections[:1000]
+
+    for detection in display_detections:
+        history_tree.insert("", "end", values=(
+            detection["timestamp"],
+            detection["id"],
+            f"{detection['confidence']:.1f}%",
+            detection["zone"],
+            detection["threat_level"],
+            f"{detection['display_x']:.2f}",
+            f"{detection['display_y']:.2f}"
+        ))
+def update_statistics():
+    # TÜM tespitleri al (sınırsız)
+    all_detections = get_all_detections_from_db()
+    
+    # Hafızadaki kayıtları da ekle
+    for detection in detection_history:
+        exists = any(db_detection["timestamp"] == detection["timestamp"] and 
+                    db_detection["id"] == detection["id"] 
+                    for db_detection in all_detections)
+        if not exists:
+            all_detections.append(detection)
+    
+    total_detections = len(all_detections)
+    
+    high_threat = len([d for d in all_detections if d["threat_level"] == "YUKSEK TEHLİKE"])
+    medium_threat = len([d for d in all_detections if d["threat_level"] == "ORTA SEVİYE"])
+    low_threat = len([d for d in all_detections if d["threat_level"] in ["DUSUK", "YOK"]])
+    
+    avg_confidence = 0
+    if all_detections:
+        avg_confidence = sum(d["confidence"] for d in all_detections) / len(all_detections)
+    
+    if not hasattr(update_statistics, 'start_time'):
+        update_statistics.start_time = datetime.now()
+    
+    active_time = datetime.now() - update_statistics.start_time
+    active_hours = int(active_time.total_seconds() // 3600)
+    active_minutes = int((active_time.total_seconds() % 3600) // 60)
+    
+    stat_values = [
+        str(total_detections),
+        str(high_threat),
+        str(medium_threat),
+        str(low_threat),
+        f"%{avg_confidence:.1f}",
+        f"{active_hours:02d}:{active_minutes:02d}"
+    ]
+    
+    for i, value in enumerate(stat_values):
+        stat_cards[i].config(text=value)
+
+def update_fire_history_tree():
+    for item in fire_history_tree.get_children():
+        fire_history_tree.delete(item)
+    
+    # TÜM ateş kayıtlarını al
+    all_fire_events = get_all_fire_history_from_db()
+    
+    # Hafızadaki kayıtları da ekle
+    for fire_event in fire_history:
+        exists = any(db_event["timestamp"] == fire_event["timestamp"] 
+                    for db_event in all_fire_events)
+        if not exists:
+            all_fire_events.append(fire_event)
+    
+    # Timestamp'e göre sırala
+    all_fire_events.sort(key=lambda x: x["timestamp"], reverse=True)
+    
+    # SADECE EKRANDA SON 1000 KAYDI GÖSTER
+    display_events = all_fire_events[:1000]
+    
+    for fire_event in display_events:
+        # client_id yerine user bilgisini kullan
+        user_info = fire_event.get("user", fire_event.get("client_id", "Bilinmiyor"))
+        
+        for drone in fire_event["drones"]:
+            result_text = "Başarılı" if fire_event["success"] else "Başarısız"
+            result_color = "green" if fire_event["success"] else "red"
+            
+            # drone['id'] integer kontrolü
+            drone_id = drone.get('id', '?')
+            if isinstance(drone_id, (int, float)):
+                drone_id_formatted = f"D{int(drone_id):03d}"
+            else:
+                drone_id_formatted = str(drone_id)
+            
+            item = fire_history_tree.insert("", "end", values=(
+                fire_event["timestamp"],
+                user_info,  # client_id yerine user_info kullan
+                drone_id_formatted,
+                drone["zone"],
+                f"{drone['confidence']:.1f}%",
+                f"{drone['x_coord']:.2f}",
+                f"{drone['y_coord']:.2f}",
+                result_text
+            ))
+            
+            fire_history_tree.item(item, tags=(result_color,))
+    
+    fire_history_tree.tag_configure("green", foreground="green")
+    fire_history_tree.tag_configure("red", foreground="red")
+def update_user_activity_tree():
+    for item in user_activity_tree.get_children():
+        user_activity_tree.delete(item)
+    
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    SELECT username, activity_type, timestamp, details
+    FROM user_activities
+    ORDER BY timestamp DESC
+    ''')
+    activities = cursor.fetchall()
+    
+    user_data = {}
+    for username, user_info in users_db.items():
+        user_data[username] = {
+            "name": user_info["name"],
+            "role": user_info["role"],
+            "status": "Çevrimdışı",
+            "session_duration": "N/A",
+            "last_activity": "N/A",
+            "fire_count": 0
+        }
+    
+    for activity in activities:
+        username = activity[0]
+        activity_type = activity[1]
+        timestamp = activity[2]
+        details = activity[3]
+        
+        if username not in user_data:
+            continue
+            
+        if user_data[username]["last_activity"] == "N/A" or timestamp > user_data[username]["last_activity"]:
+            user_data[username]["last_activity"] = timestamp
+        
+        if activity_type == "fire":
+            user_data[username]["fire_count"] += 1
+    
+    for username in active_users:
+        if username in user_data:
+            user_data[username]["status"] = "Aktif"
+    
+    for username, data in user_data.items():
+        data["session_duration"] = calculate_session_duration(
+            activities, username, data["status"] == "Aktif"
+        )
+    
+    for username, data in user_data.items():
+        status_color = "green" if data["status"] == "Aktif" else "red"
+        
+        item = user_activity_tree.insert("", "end", values=(
+            username,
+            data["name"],
+            data["role"],
+            data["status"],
+            data["session_duration"],
+            data["last_activity"],
+            data["fire_count"]
+        ))
+        
+        user_activity_tree.item(item, tags=(status_color,))
+    
+    user_activity_tree.tag_configure("green", foreground="green")
+    user_activity_tree.tag_configure("red", foreground="red")
+    
+    conn.close()
+
+# ===== DOSYA İŞLEMLERİ =====
+def clear_detection_history():
+    global detection_history
+    
+    # Kullanıcıya seçenekler sun
+    choice = messagebox.askyesnocancel(
+        "Tespit Geçmişi Temizleme", 
+        "Nasıl temizlemek istersiniz?\n\n"
+        "EVET: Sadece hafızadaki geçici verileri temizle\n"
+        "HAYIR: Veritabanındaki TÜM kayıtları sil\n"
+        "İPTAL: İşlemi iptal et"
+    )
+    
+    if choice is True:
+        # Sadece hafızayı temizle
+        detection_history.clear()
+        messagebox.showinfo("Başarılı", "Hafızadaki tespit geçmişi temizlendi!")
+    elif choice is False:
+        # Veritabanını da temizle
+        detection_history.clear()
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM detection_history")
+        conn.commit()
+        conn.close()
+        messagebox.showinfo("Başarılı", "TÜM tespit geçmişi (hafıza + veritabanı) temizlendi!")
+    # choice is None ise (İptal) hiçbir şey yapma
+    
+    if choice is not None:
+        update_history_tree()
+        update_statistics()
+def clear_fire_history():
+    global fire_history
+    
+    fire_history.clear()
+    
+    if messagebox.askyesno("Veritabanı Temizleme", "Veritabanındaki tüm ateş geçmişini de silmek istiyor musunuz?"):
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM fire_history")
+        conn.commit()
+        conn.close()
+        messagebox.showinfo("Başarılı", "Tüm ateş geçmişi temizlendi!")
+    else:
+        messagebox.showinfo("Başarılı", "Geçici hafızadaki ateş geçmişi temizlendi!")
+    
+    update_fire_history_tree()
+
+def clear_user_activity_history():
+    """Kullanıcı aktivitelerini temizle"""
+    if messagebox.askyesno("Veritabanı Temizleme", "Veritabanındaki tüm kullanıcı aktivitelerini silmek istiyor musunuz?\n\nBu işlem geri alınamaz!"):
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM user_activities")
+            conn.commit()
+            conn.close()
+            
+            # Geçici hafızadaki verileri de temizle
+            global user_activities
+            user_activities.clear()
+            
+            messagebox.showinfo("Başarılı", "Tüm kullanıcı aktiviteleri temizlendi!")
+            
+            # Tabloyu güncelle
+            update_user_activity_tree()
+        except Exception as e:
+            messagebox.showerror("Hata", f"Kullanıcı aktiviteleri temizlenirken hata oluştu:\n{str(e)}")
+
+def export_to_excel():
+    try:
+        all_detections = get_all_detections_from_db()
+        
+        if not all_detections:
+            messagebox.showwarning("Uyarı", "Dışa aktarılacak veri bulunmuyor!")
+            return
+            
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel dosyası", "*.xlsx"), ("Tüm dosyalar", "*.*")],
+            initialfile=f"drone_report_{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}.xlsx"
+        )
+        
+        if filename:
+            df = pd.DataFrame(all_detections)
+            column_order = ['timestamp', 'id', 'confidence', 'zone', 'threat_level', 'display_x', 'display_y']
+            df = df[column_order]
+            df.columns = ['Tespit Saati', 'Drone ID', 'Güven Oranı (%)', 'Bölge', 'Tehlike Seviyesi', 'X Ekseni', 'Y Ekseni']
+            
+            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name='Drone Tespitleri', index=False)
+                worksheet = writer.sheets['Drone Tespitleri']
+                column_widths = [20, 12, 15, 15, 18, 12, 12]
+                for i, width in enumerate(column_widths, 1):
+                    worksheet.column_dimensions[chr(64+i)].width = width
+                for cell in worksheet[1]:
+                    cell.font = cell.font.copy(bold=True)
+            
+            messagebox.showinfo("Başarılı", f"Rapor başarıyla Excel dosyasına kaydedildi:\n{filename}")
+    except Exception as e:
+        messagebox.showerror("Hata", f"Excel dosyası kaydedilirken hata oluştu:\n{str(e)}")
+
+def export_to_txt():
+    try:
+        all_detections = get_all_detections_from_db()
+        
+        if not all_detections:
+            messagebox.showwarning("Uyarı", "Dışa aktarılacak veri bulunmuyor!")
+            return
+            
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Metin dosyası", "*.txt"), ("Tüm dosyalar", "*.*")],
+            initialfile=f"drone_report_{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}.txt"
+        )
+        
+        if filename:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write("DRONE TESPİT RAPORU\n")
+                f.write("="*80 + "\n")
+                f.write(f"Rapor Tarihi: {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}\n")
+                f.write(f"Toplam Tespit: {len(all_detections)}\n\n")
+                
+                f.write(f"{'Tespit Saati':<20} {'ID':<8} {'Güven':<8} {'Bölge':<15} {'Tehlike':<15} {'X Eks':<8} {'Y Eks':<8}\n")
+                f.write("-" * 95 + "\n")
+                
+                for detection in all_detections:
+                    f.write(f"{detection['timestamp']:<20} ")
+                    f.write(f"{detection['id']:<8} ")
+                    f.write(f"{detection['confidence']:<8.1f} ")
+                    f.write(f"{detection['zone']:<15} ")
+                    f.write(f"{detection['threat_level']:<15} ")
+                    f.write(f"{detection['display_x']:<8.2f} ")
+                    f.write(f"{detection['display_y']:<8.2f}\n")
+            
+            messagebox.showinfo("Başarılı", f"Rapor başarıyla TXT dosyasına kaydedildi:\n{filename}")
+    except Exception as e:
+        messagebox.showerror("Hata", f"TXT dosyası kaydedilirken hata oluştu:\n{str(e)}")
+
+def export_fire_history_to_excel():
+    try:
+        all_fire_events = get_all_fire_history_from_db()
+        
+        # Hafızadaki kayıtları da ekle
+        for fire_event in fire_history:
+            exists = any(db_event["timestamp"] == fire_event["timestamp"] 
+                        for db_event in all_fire_events)
+            if not exists:
+                all_fire_events.append(fire_event)
+        
+        if not all_fire_events:
+            messagebox.showwarning("Uyarı", "Dışa aktarılacak veri bulunmuyor!")
+            return
+            
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel dosyası", "*.xlsx"), ("Tüm dosyalar", "*.*")],
+            initialfile=f"fire_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        )
+        
+        if filename:
+            export_data = []
+            for fire_event in all_fire_events:
+                # client_id yerine user bilgisini kullan
+                user_info = fire_event.get("user", fire_event.get("client_id", "Bilinmiyor"))
+                
+                for drone in fire_event["drones"]:
+                    # drone['id'] kontrolü ve formatlaması
+                    drone_id = drone.get('id', '?')
+                    if isinstance(drone_id, (int, float)):
+                        drone_id_formatted = f"D{int(drone_id):03d}"
+                    else:
+                        drone_id_formatted = str(drone_id)
+                    
+                    export_data.append({
+                        "Tarih": fire_event["timestamp"],
+                        "Kullanıcı": user_info,  # İstemci yerine Kullanıcı
+                        "Drone ID": drone_id_formatted,
+                        "Bölge": drone.get("zone", "Bilinmiyor"),
+                        "Güven (%)": round(drone.get("confidence", 0), 1),
+                        "X Ekseni": round(drone.get("x_coord", 0), 2),
+                        "Y Ekseni": round(drone.get("y_coord", 0), 2),
+                        "Sonuç": "Başarılı" if fire_event["success"] else "Başarısız"
+                    })
+            
+            df = pd.DataFrame(export_data)
+            
+            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name='Ateş Geçmişi', index=False)
+                worksheet = writer.sheets['Ateş Geçmişi']
+                column_widths = [20, 15, 12, 15, 12, 12, 12, 15]
+                for i, width in enumerate(column_widths, 1):
+                    worksheet.column_dimensions[chr(64+i)].width = width
+                for cell in worksheet[1]:
+                    cell.font = cell.font.copy(bold=True)
+                
+                # Sonuç sütununu renklendirme
+                for row in range(2, len(export_data) + 2):
+                    result_cell = worksheet.cell(row=row, column=8)
+                    if result_cell.value == "Başarılı":
+                        result_cell.font = result_cell.font.copy(color="00AA00")
+                    else:
+                        result_cell.font = result_cell.font.copy(color="AA0000")
+            
+            messagebox.showinfo("Başarılı", f"Ateş geçmişi başarıyla Excel dosyasına kaydedildi:\n{filename}")
+    except Exception as e:
+        print(f"Excel export hatası detayı: {e}")
+        messagebox.showerror("Hata", f"Excel dosyası kaydedilirken hata oluştu:\n{str(e)}")
+
+def export_fire_history_to_txt():
+    try:
+        all_fire_events = get_all_fire_history_from_db()
+        
+        # Hafızadaki kayıtları da ekle
+        for fire_event in fire_history:
+            exists = any(db_event["timestamp"] == fire_event["timestamp"] 
+                        for db_event in all_fire_events)
+            if not exists:
+                all_fire_events.append(fire_event)
+        
+        if not all_fire_events:
+            messagebox.showwarning("Uyarı", "Dışa aktarılacak veri bulunmuyor!")
+            return
+            
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Metin dosyası", "*.txt"), ("Tüm dosyalar", "*.*")],
+            initialfile=f"fire_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        )
+        
+        if filename:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write("DRONE ATEŞ GEÇMİŞİ\n")
+                f.write("="*95 + "\n")
+                f.write(f"Rapor Tarihi: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Toplam Ateş Olayı: {len(all_fire_events)}\n\n")
+                
+                f.write(f"{'Tarih':<20} {'Kullanıcı':<12} {'ID':<8} {'Bölge':<15} {'Güven':<8} {'X Eks':<8} {'Y Eks':<8} {'Sonuç':<12}\n")
+                f.write("-" * 95 + "\n")
+                
+                for fire_event in all_fire_events:
+                    # client_id yerine user bilgisini kullan
+                    user_info = fire_event.get("user", fire_event.get("client_id", "Bilinmiyor"))
+                    
+                    for drone in fire_event["drones"]:
+                        result_text = "Başarılı" if fire_event["success"] else "Başarısız"
+                        
+                        # drone['id'] kontrolü ve formatlaması
+                        drone_id = drone.get('id', '?')
+                        if isinstance(drone_id, (int, float)):
+                            drone_id_formatted = f"D{int(drone_id):03d}"
+                        else:
+                            drone_id_formatted = str(drone_id)
+                        
+                        f.write(f"{fire_event['timestamp']:<20} ")
+                        f.write(f"{user_info[:12]:<12} ")  # Kullanıcı ismini 12 karakterle sınırla
+                        f.write(f"{drone_id_formatted:<8} ")
+                        f.write(f"{drone.get('zone', 'Bilinmiyor')[:15]:<15} ")
+                        f.write(f"{drone.get('confidence', 0):<8.1f} ")
+                        f.write(f"{drone.get('x_coord', 0):<8.2f} ")
+                        f.write(f"{drone.get('y_coord', 0):<8.2f} ")
+                        f.write(f"{result_text:<12}\n")
+            
+            messagebox.showinfo("Başarılı", f"Ateş geçmişi başarıyla TXT dosyasına kaydedildi:\n{filename}")
+    except Exception as e:
+        print(f"TXT export hatası detayı: {e}")
+        messagebox.showerror("Hata", f"TXT dosyası kaydedilirken hata oluştu:\n{str(e)}")
+def export_user_activity_to_excel():
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+        SELECT username, activity_type, timestamp, details
+        FROM user_activities
+        ORDER BY timestamp
+        ''')
+        
+        activities = cursor.fetchall()
+        conn.close()
+        
+        if not activities:
+            messagebox.showwarning("Uyarı", "Dışa aktarılacak veri bulunmuyor!")
+            return
+            
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel dosyası", "*.xlsx"), ("Tüm dosyalar", "*.*")],
+            initialfile=f"user_activity_{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}.xlsx"
+        )
+        
+        if filename:
+            export_data = []
+            
+            user_sessions = {}
+            
+            for activity in activities:
+                username = activity[0]
+                activity_type = activity[1]
+                timestamp = activity[2]
+                details = activity[3]
+                
+                if username not in user_sessions:
+                    user_sessions[username] = {
+                        "name": users_db.get(username, {}).get("name", username),
+                        "role": users_db.get(username, {}).get("role", "Bilinmiyor"),
+                        "sessions": [],
+                        "fire_commands": []
+                    }
+                
+                if activity_type == "login":
+                    user_sessions[username]["sessions"].append({
+                        "login_time": timestamp,
+                        "logout_time": None,
+                        "fire_count": 0
+                    })
+                elif activity_type == "logout" and user_sessions[username]["sessions"]:
+                    for session in reversed(user_sessions[username]["sessions"]):
+                        if session["logout_time"] is None:
+                            session["logout_time"] = timestamp
+                            break
+                elif activity_type == "fire":
+                    user_sessions[username]["fire_commands"].append(timestamp)
+                    
+                    for session in reversed(user_sessions[username]["sessions"]):
+                        if session["logout_time"] is None or (session["login_time"] <= timestamp <= session["logout_time"]):
+                            session["fire_count"] += 1
+                            break
+            
+            for username, data in user_sessions.items():
+                for session in data["sessions"]:
+                    export_data.append({
+                        "Kullanıcı Adı": username,
+                        "Tam Adı": data["name"],
+                        "Rol": data["role"],
+                        "Giriş Zamanı": session["login_time"],
+                        "Çıkış Zamanı": session["logout_time"] if session["logout_time"] else "Hala Aktif",
+                        "Oturum Süresi": calculate_duration(session["login_time"], session["logout_time"]),
+                        "Ateş Sayısı": session["fire_count"]
+                    })
+            
+            df = pd.DataFrame(export_data)
+            
+            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name='Kullanıcı Aktiviteleri', index=False)
+                worksheet = writer.sheets['Kullanıcı Aktiviteleri']
+                column_widths = [15, 20, 10, 20, 20, 15, 10]
+                for i, width in enumerate(column_widths, 1):
+                    worksheet.column_dimensions[chr(64+i)].width = width
+                for cell in worksheet[1]:
+                    cell.font = cell.font.copy(bold=True)
+            
+            messagebox.showinfo("Başarılı", f"Kullanıcı aktiviteleri başarıyla Excel dosyasına kaydedildi:\n{filename}")
+    except Exception as e:
+        messagebox.showerror("Hata", f"Excel dosyası kaydedilirken hata oluştu:\n{str(e)}")
+
+def calculate_duration(start_time_str, end_time_str):
+    try:
+        start_time = datetime.strptime(start_time_str, '%Y-%m-%d %H:%M:%S.%f')
+        
+        if end_time_str is None:
+            end_time = datetime.now()
+        else:
+            end_time = datetime.strptime(end_time_str, '%Y-%m-%d %H:%M:%S.%f')
+        
+        duration = end_time - start_time
+        hours, remainder = divmod(duration.total_seconds(), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        return f"{int(hours)}s {int(minutes)}d {int(seconds)}s"
+    except:
+        return "Hesaplanamadı"
+
+# ===== SİSTEM FONKSİYONLARI =====
+def play_alert():
+    if not pygame.mixer.music.get_busy():
+        pygame.mixer.music.play()
+
+def start_server():
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind((SERVER_HOST, SERVER_PORT))
+    server_socket.listen(5)
+    
+    print(f"Sunucu {SERVER_HOST}:{SERVER_PORT} adresinde başlatıldı...")
+    
+    def handle_client(client_socket, client_address):
+        print(f"Yeni bağlantı: {client_address}")
+        connected_clients.append(client_socket)
+        current_user = None
+        
+        try:
+            while True:
+                try:
+                    data = client_socket.recv(1024).decode('utf-8')
+                    if data:
+                        message = json.loads(data)
+                        
+                        if message.get("type") == "login":
+                            username = message.get("username")
+                            password = message.get("password")
+                            
+                            if username in users_db and users_db[username]["password"] == password:
+                                current_user = {
+                                    "username": username,
+                                    "name": users_db[username]["name"],
+                                    "role": users_db[username]["role"],
+                                    "login_time": message.get("timestamp"),
+                                    "client_socket": client_socket
+                                }
+                                active_users[username] = current_user
+                                
+                                save_user_activity_to_db(
+                                    username, 
+                                    "login", 
+                                    message.get("timestamp"),
+                                    f"IP: {client_address[0]}"
+                                )
+                                
+                                if username not in user_activities:
+                                    user_activities[username] = {
+                                        "login_times": [],
+                                        "logout_times": [],
+                                        "fire_commands": []
+                                    }
+                                
+                                user_activities[username]["login_times"].append(message.get("timestamp"))
+                                print(f"Kullanıcı giriş yaptı: {username} (Rol: {users_db[username]['role']})")
+                                
+                                window.after(0, update_user_activity_tree)
+                                
+                                response = {
+                                    "type": "login_response",
+                                    "success": True,
+                                    "message": "Giriş başarılı",
+                                    "user": {
+                                        "username": username,
+                                        "name": users_db[username]["name"],
+                                        "role": users_db[username]["role"]
+                                    }
+                                }
+                                client_socket.send((json.dumps(response) + "\n").encode('utf-8'))
+                            else:
+                                print(f"Geçersiz kullanıcı girişi denemesi: {username}")
+                                
+                                response = {
+                                    "type": "login_response",
+                                    "success": False,
+                                    "message": "Geçersiz kullanıcı adı veya şifre"
+                                }
+                                client_socket.send((json.dumps(response) + "\n").encode('utf-8'))
+                        
+                        elif message.get("type") == "logout":
+                            username = message.get("username")
+                            if username in active_users:
+                                logout_time = message.get("timestamp")
+                                
+                                save_user_activity_to_db(
+                                    username, 
+                                    "logout", 
+                                    logout_time,
+                                    f"IP: {client_address[0]}"
+                                )
+                                
+                                if username in user_activities:
+                                    user_activities[username]["logout_times"].append(logout_time)
+                                
+                                del active_users[username]
+                                print(f"Kullanıcı çıkış yaptı: {username}")
+                                
+                                window.after(0, update_user_activity_tree)
+                        
+                        elif message.get("command") == "FIRE":
+                            username = message.get("user", "unknown")
+                            print(f"ATEŞ EMRİ alındı - Kullanıcı: {username}, İstemci: {client_address}")
+                            
+                            fire_success = False
+                            if username in users_db:
+                                role = users_db[username]["role"]
+                                if role in ["admin", "yonetici", "operator"]:
+                                    fire_success = random.choice([True, False,True])
+                                else:
+                                    print(f"Kullanıcı {username} ateş etme yetkisine sahip değil: {role}")
+                            
+                            fire_entry = {
+                                "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                                "client_id": message.get("client_id", "unknown"),
+                                "user": username,
+                                "success": fire_success,
+                                "drones": []
+                            }
+                            
+                            save_user_activity_to_db(
+                                username, 
+                                "fire", 
+                                fire_entry["timestamp"],
+                                f"İstemci: {fire_entry['client_id']}, Başarılı: {fire_success}"
+                            )
+                            
+                            if username in user_activities:
+                                user_activities[username]["fire_commands"].append({
+                                    "timestamp": fire_entry["timestamp"],
+                                    "success": fire_success
+                                })
+                            
+                            if current_drone_data.get("threat_level") == "YUKSEK TEHLİKE":
+                                for detection in current_drone_data.get("detections", []):
+                                    pos = detection.get("position", {})
+                                    
+                                    raw_map_x = pos.get("map_x", 0.5)
+                                    raw_map_y = pos.get("map_y", 0.5)
+                                    display_x = -((raw_map_x * 2) - 1)
+                                    display_y = -((raw_map_y * 2) - 1)
+                                    
+                                    drone_info = {
+                                        "id": detection.get("id", "?"),
+                                        "confidence": detection.get("confidence", 0),
+                                        "zone": pos.get("zone", get_direction_from_coordinates(display_x, display_y)),
+                                        "x_coord": display_x,
+                                        "y_coord": display_y
+                                    }
+                                    fire_entry["drones"].append(drone_info)
+                            
+                            fire_history.append(fire_entry)
+                            if len(fire_history) > max_fire_history:
+                                fire_history.pop(0)
+                            
+                            save_fire_to_db(fire_entry)
+                            
+                            response = {
+                                "type": "fire_response",
+                                "success": fire_success,
+                                "message": "Ateş etme işlemi başarılı!" if fire_success else "Ateş etme işlemi başarısız!",
+                                "timestamp": fire_entry["timestamp"]
+                            }
+                            
+                            client_socket.send((json.dumps(response) + "\n").encode('utf-8'))
+                            
+                            window.after(0, update_fire_history_tree)
+                            window.after(0, update_user_activity_tree)
+                            
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    print(f"İstemci veri işleme hatası: {e}")
+                    break
+                    
+        except Exception as e:
+            print(f"İstemci hatası {client_address}: {e}")
+        finally:
+            if current_user and current_user["username"] in active_users:
+                username = current_user["username"]
+                logout_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                
+                save_user_activity_to_db(
+                    username, 
+                    "logout", 
+                    logout_time,
+                    f"IP: {client_address[0]}"
+                )
+                
+                if username in user_activities:
+                    user_activities[username]["logout_times"].append(logout_time)
+                
+                del active_users[username]
+                print(f"Kullanıcı bağlantısı kesildi: {username}")
+                
+                window.after(0, update_user_activity_tree)
+        
+            if client_socket in connected_clients:
+                connected_clients.remove(client_socket)
+            client_socket.close()
+            print(f"Bağlantı kesildi: {client_address}")
+    
+    def accept_connections():
+        while True:
+            try:
+                client_socket, client_address = server_socket.accept()
+                client_socket.settimeout(1.0)
+                client_thread = threading.Thread(
+                    target=handle_client, 
+                    args=(client_socket, client_address)
+                )
+                client_thread.daemon = True
+                client_thread.start()
+            except Exception as e:
+                print(f"Sunucu hatası: {e}")
+                break
+    
+    accept_thread = threading.Thread(target=accept_connections)
+    accept_thread.daemon = True
+    accept_thread.start()
+
+def broadcast_drone_data():
+    if not connected_clients:
+        return
+    
+    message = json.dumps(current_drone_data) + "\n"
+    
+    for client in connected_clients[:]:
+        try:
+            client.send(message.encode('utf-8'))
+        except Exception as e:
+            print(f"İstemciye veri gönderme hatası: {e}")
+            if client in connected_clients:
+                connected_clients.remove(client)
+
+# ===== ARAYÜZ OLUŞTURMA =====
+window = tk.Tk()
+window.title("Drone Tespit Server - Raporlar")
+window.geometry("1400x900")
+
+main_frame = tk.Frame(window)
+main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+status_frame = tk.LabelFrame(main_frame, text="Sistem Durumu", font=("Arial", 14, "bold"), height=120)
+status_frame.pack(fill=tk.X, pady=(0, 10))
+status_frame.pack_propagate(False)
+
+status_grid = tk.Frame(status_frame)
+status_grid.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+left_status = tk.Frame(status_grid)
+left_status.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+server_label = tk.Label(left_status, text=f"Server: {SERVER_HOST}:{SERVER_PORT}", 
+                       font=("Arial", 11, "bold"), fg="blue")
+server_label.pack(anchor="w")
+
+client_count_label = tk.Label(left_status, text="Bağlı İstemci: 0", font=("Arial", 11))
+client_count_label.pack(anchor="w")
+
+system_time_label = tk.Label(left_status, text="", font=("Arial", 11))
+system_time_label.pack(anchor="w")
+
+middle_status = tk.Frame(status_grid)
+middle_status.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=20)
+
+threat_level_label = tk.Label(middle_status, text="Tehlike Seviyesi: YOK", 
+                             font=("Arial", 12, "bold"), fg="green")
+threat_level_label.pack(anchor="w")
+
+active_drones_label = tk.Label(middle_status, text="Aktif Drone: 0", font=("Arial", 11))
+active_drones_label.pack(anchor="w")
+
+last_detection_label = tk.Label(middle_status, text="Son Tespit: -", font=("Arial", 11))
+last_detection_label.pack(anchor="w")
+
+right_status = tk.Frame(status_grid)
+right_status.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+camera_status_label = tk.Label(right_status, text="Kamera: Aktif", 
+                              font=("Arial", 11), fg="green")
+camera_status_label.pack(anchor="w")
+
+ai_model_label = tk.Label(right_status, text="AI Model: Yüklü", 
+                         font=("Arial", 11), fg="green")
+ai_model_label.pack(anchor="w")
+
+alert_system_label = tk.Label(right_status, text="Alarm Sistemi: Hazır", 
+                             font=("Arial", 11), fg="green")
+alert_system_label.pack(anchor="w")
+
+content_frame = tk.Frame(main_frame)
+content_frame.pack(fill=tk.BOTH, expand=True)
+
+notebook = ttk.Notebook(content_frame)
+notebook.pack(fill=tk.BOTH, expand=True)
+
+current_frame = tk.Frame(notebook)
+notebook.add(current_frame, text="Anlık Tespitler")
+
+current_tree_frame = tk.Frame(current_frame)
+current_tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+current_tree_scroll = tk.Scrollbar(current_tree_frame)
+current_tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+current_tree = ttk.Treeview(current_tree_frame, 
+                           columns=("ID", "Tehlike Seviyesi", "Güven", "Bölge", "X Ekseni", "Y Ekseni"),
+                           show="headings",
+                           yscrollcommand=current_tree_scroll.set)
+
+current_tree_scroll.config(command=current_tree.yview)
+
+columns_config = [
+    ("ID", 80),
+    ("Tehlike Seviyesi", 120),
+    ("Güven", 100),
+    ("Bölge", 120),
+    ("X Ekseni", 100),
+    ("Y Ekseni", 100)
+]
+
+for col, width in columns_config:
+    current_tree.heading(col, text=col)
+    current_tree.column(col, width=width, anchor="center")
+
+current_tree.pack(fill=tk.BOTH, expand=True)
+
+history_frame = tk.Frame(notebook)
+notebook.add(history_frame, text="Tespit Geçmişi")
+
+history_controls = tk.Frame(history_frame)
+history_controls.pack(fill=tk.X, padx=10, pady=5)
+
+clear_history_btn = tk.Button(history_controls, text="Geçmişi Temizle", 
+                             command=clear_detection_history)
+clear_history_btn.pack(side=tk.LEFT)
+
+export_excel_btn = tk.Button(history_controls, text="Excel'e Aktar", 
+                            command=export_to_excel)
+export_excel_btn.pack(side=tk.LEFT, padx=(10, 0))
+
+export_txt_btn = tk.Button(history_controls, text="TXT'ye Aktar", 
+                          command=export_to_txt)
+export_txt_btn.pack(side=tk.LEFT, padx=(10, 0))
+
+history_tree_frame = tk.Frame(history_frame)
+history_tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+history_tree_scroll = tk.Scrollbar(history_tree_frame)
+history_tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+history_tree = ttk.Treeview(history_tree_frame,
+                           columns=("Tespit Saati", "ID", "Güven", "Bölge", "Tehlike Seviyesi", "X Ekseni", "Y Ekseni"),
+                           show="headings",
+                           yscrollcommand=history_tree_scroll.set)
+
+history_tree_scroll.config(command=history_tree.yview)
+
+history_columns_config = [
+    ("Tespit Saati", 180),
+    ("ID", 60),
+    ("Güven", 80),
+    ("Bölge", 120),
+    ("Tehlike Seviyesi", 120),
+    ("X Ekseni", 70),
+    ("Y Ekseni", 70)
+]
+
+for col, width in history_columns_config:
+    history_tree.heading(col, text=col)
+    history_tree.column(col, width=width, anchor="center")
+
+history_tree.pack(fill=tk.BOTH, expand=True)
+
+stats_frame = tk.Frame(notebook)
+notebook.add(stats_frame, text="İstatistikler")
+
+stats_grid = tk.Frame(stats_frame)
+stats_grid.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+stat_cards = []
+stat_texts = ["Toplam Tespit", "Yüksek Tehlike", "Orta Seviye", "Düşük Tehlike", 
+              "Ortalama Güven", "Aktif Süre"]
+
+for i in range(6):
+    card_frame = tk.LabelFrame(stats_grid, text=stat_texts[i], font=("Arial", 12, "bold"))
+    card_frame.grid(row=i//3, column=i%3, padx=10, pady=10, sticky="nsew", ipadx=20, ipady=20)
+    
+    value_label = tk.Label(card_frame, text="0", font=("Arial", 24, "bold"), fg="blue")
+    value_label.pack()
+    
+    stat_cards.append(value_label)
+
+for i in range(2):
+    stats_grid.grid_rowconfigure(i, weight=1)
+for i in range(3):
+    stats_grid.grid_columnconfigure(i, weight=1)
+
+fire_history_frame = tk.Frame(notebook)
+notebook.add(fire_history_frame, text="Ateş Geçmişi")
+
+fire_history_controls = tk.Frame(fire_history_frame)
+fire_history_controls.pack(fill=tk.X, padx=10, pady=5)
+
+clear_fire_history_btn = tk.Button(fire_history_controls, text="Geçmişi Temizle", 
+                                   command=clear_fire_history)
+clear_fire_history_btn.pack(side=tk.LEFT)
+
+export_fire_history_excel_btn = tk.Button(fire_history_controls, text="Excel'e Aktar", 
+                                         command=export_fire_history_to_excel)
+export_fire_history_excel_btn.pack(side=tk.LEFT, padx=(10, 0))
+
+export_fire_history_txt_btn = tk.Button(fire_history_controls, text="TXT'ye Aktar", 
+                                       command=export_fire_history_to_txt)
+export_fire_history_txt_btn.pack(side=tk.LEFT, padx=(10, 0))
+
+fire_history_tree_frame = tk.Frame(fire_history_frame)
+fire_history_tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+fire_history_tree_scroll = tk.Scrollbar(fire_history_tree_frame)
+fire_history_tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+fire_history_tree = ttk.Treeview(fire_history_tree_frame,
+                               columns=("Tarih", "İstemci", "Drone ID", "Bölge", "Güven", "X Ekseni", "Y Ekseni", "Sonuç"),
+                               show="headings",
+                               yscrollcommand=fire_history_tree_scroll.set)
+
+fire_history_tree_scroll.config(command=fire_history_tree.yview)
+
+fire_history_columns_config = [
+    ("Tarih", 180),
+    ("İstemci", 100),
+    ("Drone ID", 80),
+    ("Bölge", 120),
+    ("Güven", 80),
+    ("X Ekseni", 70),
+    ("Y Ekseni", 70),
+    ("Sonuç", 100)
+]
+
+for col, width in fire_history_columns_config:
+    fire_history_tree.heading(col, text=col)
+    fire_history_tree.column(col, width=width, anchor="center")
+
+fire_history_tree.pack(fill=tk.BOTH, expand=True)
+
+user_activity_frame = tk.Frame(notebook)
+notebook.add(user_activity_frame, text="Kullanıcı Aktiviteleri")
+
+user_activity_controls = tk.Frame(user_activity_frame)
+user_activity_controls.pack(fill=tk.X, padx=10, pady=5)
+
+refresh_user_activity_btn = tk.Button(user_activity_controls, text="Yenile", 
+                                     command=update_user_activity_tree)
+refresh_user_activity_btn.pack(side=tk.LEFT)
+
+clear_user_activity_btn = tk.Button(user_activity_controls, text="Geçmişi Temizle", 
+                                   command=clear_user_activity_history)
+clear_user_activity_btn.pack(side=tk.LEFT, padx=(10, 0))
+
+export_user_activity_btn = tk.Button(user_activity_controls, text="Excel'e Aktar", 
+                                    command=export_user_activity_to_excel)
+export_user_activity_btn.pack(side=tk.LEFT, padx=(10, 0))
+
+user_activity_tree_frame = tk.Frame(user_activity_frame)
+user_activity_tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+user_activity_tree_scroll = tk.Scrollbar(user_activity_tree_frame)
+user_activity_tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+user_activity_tree = ttk.Treeview(user_activity_tree_frame,
+                                 columns=("Kullanıcı Adı", "Tam Adı", "Rol", "Durum", "Oturum Süresi", "Son Aktivite", "Ateş Sayısı"),
+                                 show="headings",
+                                 yscrollcommand=user_activity_tree_scroll.set)
+
+user_activity_tree_scroll.config(command=user_activity_tree.yview)
+
+user_activity_columns_config = [
+    ("Kullanıcı Adı", 120),
+    ("Tam Adı", 150),
+    ("Rol", 100),
+    ("Durum", 100),
+    ("Oturum Süresi", 120),
+    ("Son Aktivite", 150),
+    ("Ateş Sayısı", 100)
+]
+
+for col, width in user_activity_columns_config:
+    user_activity_tree.heading(col, text=col)
+    user_activity_tree.column(col, width=width, anchor="center")
+
+user_activity_tree.pack(fill=tk.BOTH, expand=True)
+
+# ===== KAMERA VE TESPİT SİSTEMİ =====
+cap = cv2.VideoCapture(0)
+
+def background_detection():
+    global current_drone_data, detection_history
+    
+    ret, frame = cap.read()
+    if not ret:
+        return
+
+    if model is None:
+        return
+
+    results = model(frame)
+    
+    threat_level = "YOK"
+    alert_triggered = False
+    detections = []
+    
+    frame_height, frame_width = frame.shape[:2]
+
+    for i, result in enumerate(results):
+        for j, box in enumerate(result.boxes):
+            cls_id = int(box.cls[0].item())
+            cls_name = model.names[cls_id]
+
+            if cls_name.lower() != "drone":
+                continue
+
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+            width = x2 - x1
+            height = y2 - y1
+            area = width * height
+            confidence = box.conf[0].item() * 100
+
+            center_x = int((x1 + x2) / 2)
+            center_y = int((y1 + y2) / 2)
+            
+            map_x = center_x / frame_width
+            map_y = center_y / frame_height
+            
+            display_x = -((map_x * 2) - 1)
+            display_y = -((map_y * 2) - 1)
+            
+            zone_name = get_direction_from_coordinates(display_x, display_y)
+            
+            current_threat = "YOK"
+            distance_info = "Uzak"
+            
+            if area > 40000:
+                current_threat = "YUKSEK TEHLİKE"
+                distance_info = "Çok Yakın"
+                alert_triggered = True
+            elif area > 20000:
+                current_threat = "ORTA SEVİYE"
+                distance_info = "Yakın"
+            elif area > 5000:
+                current_threat = "DUSUK"
+                distance_info = "Orta"
+            else:
+                current_threat = "DUSUK"
+                distance_info = "Uzak"
+            
+            if current_threat == "YUKSEK TEHLİKE":
+                threat_level = "YUKSEK TEHLİKE"
+            elif current_threat == "ORTA SEVİYE" and threat_level != "YUKSEK TEHLİKE":
+                threat_level = "ORTA SEVİYE"
+            elif current_threat == "DUSUK" and threat_level == "YOK":
+                threat_level = "DUSUK"
+            
+            detections.append({
+                "id": len(detections) + 1,
+                "confidence": confidence,
+                "position": {
+                    "map_x": map_x,
+                    "map_y": map_y,
+                    "zone": zone_name,
+                    "distance": distance_info
+                }
+            })
+    
+    current_drone_data = {
+        "drone_count": len(detections),
+        "threat_level": threat_level,
+        "detections": detections,
+        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+        "fire_authorized": threat_level == "YUKSEK TEHLİKE"
+    }
+    
+    if detections:
+        for detection in detections:
+            pos = detection["position"]
+            
+            raw_map_x = pos.get("map_x", 0.5)
+            raw_map_y = pos.get("map_y", 0.5)
+            display_x = -((raw_map_x * 2) - 1)
+            display_y = -((raw_map_y * 2) - 1)
+            
+            zone_name = pos.get("zone", get_direction_from_coordinates(display_x, display_y))
+            
+            history_entry = {
+                "timestamp": current_drone_data["timestamp"],
+                "id": f"D{detection['id']:03d}",
+                "confidence": detection['confidence'],
+                "zone": zone_name,
+                "threat_level": threat_level,
+                "display_x": display_x,
+                "display_y": display_y
+            }
+            
+            detection_history.append(history_entry)
+            save_detection_to_db(history_entry)
+        
+        if len(detection_history) > max_history:
+            detection_history = detection_history[-max_history:]
+    
+    if alert_triggered:
+        play_alert()
+    
+    window.after(0, update_current_tree)
+    window.after(0, update_history_tree)
+    window.after(0, update_statistics)
+    window.after(0, lambda: threat_level_label.config(
+        text=f"Tehlike Seviyesi: {threat_level}",
+        fg="red" if threat_level == "YUKSEK TEHLİKE" else "orange" if threat_level == "ORTA SEVİYE" else "green"
+    ))
+    window.after(0, lambda: active_drones_label.config(text=f"Aktif Drone: {len(detections)}"))
+    window.after(0, lambda: last_detection_label.config(
+        text=f"Son Tespit: {current_drone_data['timestamp']}"
+    ))
+    
+    broadcast_drone_data()
+
+# ===== SİSTEMİ BAŞLATMA =====
+def update_system_time():
+    system_time_label.config(text=f"Sistem Zamanı: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    window.after(1000, update_system_time)
+
+def update_client_count():
+    client_count_label.config(text=f"Bağlı İstemci: {len(connected_clients)}")
+    window.after(1000, update_client_count)
+# === MODBUS THREAD BAŞLATMA ===
+threading.Thread(target=setup_modbus_server, daemon=True).start()
+threading.Thread(target=update_modbus_registers, daemon=True).start()
+start_server()
+
+def detection_loop():
+    background_detection()
+    window.after(100, detection_loop)
+
+update_system_time()
+update_client_count()
+detection_loop()
+
+window.mainloop()
+
+cap.release()
+cv2.destroyAllWindows()
