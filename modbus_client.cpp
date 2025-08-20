@@ -19,7 +19,7 @@
 #endif
 
 // Modbus TCP protokol sabitleri
-#define MODBUS_TCP_PORT 8888
+#define MODBUS_TCP_PORT 5020
 #define MODBUS_MAX_READ_REGISTERS 125
 #define MODBUS_HEADER_LENGTH 6
 #define MODBUS_TCP_HEADER_LENGTH 7
